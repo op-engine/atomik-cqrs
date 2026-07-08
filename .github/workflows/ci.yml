@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-${{ matrix.os }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: zig-${{ matrix.os }}-
+
+      - name: Check formatting
+        run: zig fmt --check src/ edge/ build.zig
+
+      - name: Build (default)
+        run: zig build
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build WASM edge harness
+        run: zig build wasm
+
+      - name: Build migration tool
+        run: zig build migrate
