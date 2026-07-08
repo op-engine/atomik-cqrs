@@ -14,7 +14,7 @@ pub const JsonError = error{
 /// Escape a string for safe embedding inside a JSON string literal.
 /// Handles the full RFC 8259 requirement: `"`, `\`, and control characters
 /// (U+0000–U+001F). `data` fields that are already valid JSON are passed
-/// through unescaped — only call this on values that go between `"..."`.
+/// through unescaped; only call this on values that go between `"..."`.
 pub fn escape_json_string(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -70,7 +70,7 @@ pub fn serialize_error(allocator: std.mem.Allocator, code: []const u8, message: 
 }
 
 /// Serialize a `cqrs.DomainEvent` to its JSON representation.
-/// `event.data` is embedded as a raw JSON value — the caller is responsible
+/// `event.data` is embedded as a raw JSON value; the caller is responsible
 /// for ensuring it is valid JSON. All other string fields are escaped.
 pub fn serialize_event(allocator: std.mem.Allocator, event: cqrs.DomainEvent) ![]const u8 {
     const event_id_str = try cqrs.uuid_to_string(allocator, event.event_id);
@@ -147,7 +147,7 @@ test "escape_json_string handles quotes, backslashes, and control characters" {
 test "serialize_error escapes injected quotes in code and message" {
     const out = try serialize_error(std.testing.allocator, "ERR\",\"injected\":true,\"x", "bad\\value");
     defer std.testing.allocator.free(out);
-    // The output must be parseable JSON — the injection attempt should be inert.
+    // The output must be parseable JSON; the injection attempt should be inert.
     try std.testing.expect(std.mem.indexOf(u8, out, "\\\"injected\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "bad\\\\value") != null);
 }

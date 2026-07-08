@@ -1,6 +1,7 @@
-// Mock libpq for development when libpq-dev not installed
-// IMPORTANT: Replace with real libpq.zig once libpq-dev is installed
-// This is a temporary stub for Phase 2 development
+// Null-object mock of libpq. Every function returns a safe failing value so
+// tests run without libpq-dev installed. To use a real database, change the
+// import in postgres_pool.zig from "libpq_mock.zig" to "libpq.zig" and link
+// libpq in build.zig. See ADR-07 in docs/adr/decisions.md.
 
 pub const PGconn = opaque {};
 pub const PGresult = opaque {};

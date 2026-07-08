@@ -11,9 +11,9 @@ This document maps the classical design patterns at work in the codebase to thei
 **What it is:** CQRS separates the write side (commands that change state) from the read side (queries that return state). They use different models: commands emit events; queries read projections or replay events.
 
 **How it appears here:**  
-- `Command` is the write-side envelope. It carries `command_type`, `tenant_id`, `user_id`, `timestamp`, and an optional `idempotency_key`. It represents intent — something the user wants to do.  
+- `Command` is the write-side envelope. It carries `command_type`, `tenant_id`, `user_id`, `timestamp`, and an optional `idempotency_key`. It represents intent: something the user wants to do.  
 - `DomainEvent` is the result of a command being accepted. It is immutable and versioned. Once written, it never changes.  
-- `QueryFilters` in `cqrs.zig` and `query` in `EventStoreAdapter` represent the read side — filtering the event stream without going through the command pipeline.
+- `QueryFilters` in `cqrs.zig` and `query` in `EventStoreAdapter` represent the read side; they filter the event stream without going through the command pipeline.
 
 **Why:** The separation means writes (appending events) and reads (querying/replaying events) can scale and evolve independently. Reads never block on writes. You can add a new read model without touching the command handlers.
 
@@ -26,11 +26,41 @@ This document maps the classical design patterns at work in the codebase to thei
 **What it is:** Instead of storing the current state of an aggregate, you store the ordered sequence of events that produced that state. Current state is derived by replaying those events in order.
 
 **How it appears here:**  
-`Aggregate.load_from_history` iterates over a slice of `DomainEvent`s and calls an `apply_event` function pointer for each one, advancing the version counter. `Aggregate.record` accumulates new events into `uncommitted_events` — they exist in memory until the caller flushes them to the adapter with `append_events`. Nothing is stored until you explicitly write.
+`Aggregate.load_from_history` iterates over a slice of `DomainEvent`s and calls an `apply_event` function pointer for each one, advancing the version counter. `Aggregate.record` accumulates new events into `uncommitted_events`; they exist in memory until the caller flushes them to the adapter with `append_events`. Nothing is stored until you explicitly write.
 
 The PostgreSQL schema reflects this: the `events` table is append-only. There is no UPDATE path in any adapter. `version ASC` ordering on the index mirrors the replay direction.
 
 **Why:** For financial systems, the event log is the source of truth. You can always reconstruct state from it, audit every change, and replay history to debug production incidents or build new read models retroactively. Storing only current state discards this.
+
+### Event Schema Versioning
+
+Events are immutable once written; this is a feature, not a constraint. The implication is that **event schemas must evolve additively or use versioned event type names.**
+
+**Safe:** Adding new optional fields to an event payload. Existing replays skip fields they don't recognize; new replays can read them.
+
+**Breaking:** Renaming or removing a field, or changing a field's type. Old events in the store will not match the new shape; replays will fail or silently corrupt state.
+
+The recommended pattern is to encode the version in the `event_type` string:
+
+```zig
+// Initial release
+.event_type = "OrderCreated.v1"
+
+// Breaking schema change: new events use v2; old events stay as v1
+.event_type = "OrderCreated.v2"
+```
+
+Your `apply_event` function dispatches on `event.event_type` and handles both:
+
+```zig
+if (std.mem.eql(u8, event.event_type, "OrderCreated.v1")) {
+    // parse v1 payload (no currency field)
+} else if (std.mem.eql(u8, event.event_type, "OrderCreated.v2")) {
+    // parse v2 payload (includes currency field)
+}
+```
+
+The library does not enforce this discipline; the `event_type` field is an open string by design (see ADR-02). The versioning strategy is the consuming application's responsibility.
 
 ---
 
@@ -43,7 +73,7 @@ The PostgreSQL schema reflects this: the `events` table is append-only. There is
 **How it appears here:**  
 `EventRepository.append` takes a `tenant_id` and a slice of `DomainEvent`s and issues parameterized SQL inside a transaction. `EventRepository.get_events` takes a `tenant_id`, `aggregate_id`, and `aggregate_type` and returns a `ResultSet`. The caller never writes SQL.
 
-`AuditLogRepository.log_event` does the same for compliance events — it converts UUIDs to hex, formats timestamps, and inserts a row.
+`AuditLogRepository.log_event` does the same for compliance events; it converts UUIDs to hex, formats timestamps, and inserts a row.
 
 **Why:** The repository isolates SQL from the rest of the application. If the schema changes, only the repository changes. The domain logic that calls `repo.append(tenant_id, events)` is unaffected.
 
@@ -56,11 +86,11 @@ The PostgreSQL schema reflects this: the `events` table is append-only. There is
 **What it is:** The Adapter pattern wraps an incompatible interface so it fits an expected one. Here, each concrete storage backend (PostgreSQL, SQLite, in-memory) has a different internal structure, but all of them expose the same `EventStoreAdapter` interface to callers.
 
 **How it appears here:**  
-`EventStoreAdapter` is a struct holding a `*anyopaque` context pointer and six function pointers. Each concrete adapter implements those six functions and exposes a `to_adapter()` method that populates the vtable. Callers hold an `EventStoreAdapter` and call `adapter.append_events(...)` without knowing whether they are talking to PostgreSQL or an in-memory store.
+`EventStoreAdapter` is a struct holding a `*anyopaque` context pointer and seven function pointers: six storage operations (`create_schema`, `append_events`, `get_events`, `query`, `find_by_idempotency_key`, `store_idempotency`) plus `deinit`. Each concrete adapter implements those seven functions and exposes a `to_adapter()` method that populates the vtable. Callers hold an `EventStoreAdapter` and call `adapter.append_events(...)` without knowing whether they are talking to PostgreSQL or an in-memory store.
 
 This is Zig's idiomatic approach to interface polymorphism: there is no `interface` keyword, so runtime polymorphism is expressed as a vtable struct. The `*anyopaque` context pointer is the equivalent of a `this` pointer; `@ptrCast(@alignCast(ctx))` recovers the concrete type inside each function.
 
-**Why vtable instead of comptime generics?** A comptime generic adapter (`fn doSomething(adapter: anytype)`) embeds the concrete type in the call signature. That means the consuming application cannot store an adapter in a plain struct field without parameterizing that struct. A vtable has no type parameter — you can store it, pass it, and swap it at runtime. For a library that expects to be used with different backends in different test/production contexts, this is the right tradeoff.
+**Why vtable instead of comptime generics?** A comptime generic adapter (`fn doSomething(adapter: anytype)`) embeds the concrete type in the call signature. That means the consuming application cannot store an adapter in a plain struct field without parameterizing that struct. A vtable has no type parameter; you can store it, pass it, and swap it at runtime. For a library that expects to be used with different backends in different test/production contexts, this is the right tradeoff.
 
 ---
 
@@ -84,7 +114,7 @@ The SQLite and MySQL adapter files are scaffolded: the struct, the `to_adapter()
 **What it is:** A pool pre-allocates a fixed number of expensive resources (database connections) and lends them out to callers, returning them to the pool when done.
 
 **How it appears here:**  
-`ConnectionPool` pre-allocates a `[]Connection` slice up to `max_connections`. `get_connection` either initializes a new slot (if capacity remains) or returns slot 0 (if the pool is full). `release_connection` is a no-op in this release — connection lifecycle management is minimal and documented as such.
+`ConnectionPool` pre-allocates a `[]Connection` slice up to `max_connections`. `get_connection` either initializes a new slot (if capacity remains) or returns slot 0 (if the pool is full). `release_connection` is a no-op in this release; connection lifecycle management is minimal and documented as such.
 
 **Why:** Opening a PostgreSQL connection is expensive: a TCP handshake, TLS negotiation, and authentication round-trip. Amortizing that cost across requests is the baseline requirement for any production database client.
 
@@ -94,7 +124,7 @@ The SQLite and MySQL adapter files are scaffolded: the struct, the `to_adapter()
 
 **Where:** `src/postgres_pool.zig` (`Transaction`), every `deinit` method across all structs.
 
-**What it is:** Resources are tied to object lifetime. Acquisition happens in `init`; release happens in `deinit`, typically via `defer`. If the scope exits for any reason — including an error — the resource is released.
+**What it is:** Resources are tied to object lifetime. Acquisition happens in `init`; release happens in `deinit`, typically via `defer`. If the scope exits for any reason, including an error, the resource is released.
 
 **How it appears here:**  
 `Transaction.init` calls `BEGIN`. `Transaction.deinit` calls `ROLLBACK` if `commit` was never called. Callers write:
@@ -108,7 +138,7 @@ try txn.commit();
 
 If any step between `init` and `commit` returns an error, the `defer` fires, rolling back. Forgetting the `defer` is the bug; the RAII wrapper makes the forgetting hard.
 
-Similarly, every struct that allocates — `Aggregate`, `ConnectionPool`, `ResultSet`, `Router` — has a `deinit` method, and every call site pairs it with `defer`.
+Similarly, every struct that allocates (`Aggregate`, `ConnectionPool`, `ResultSet`, `Router`) has a `deinit` method, and every call site pairs it with `defer`.
 
 **Why:** Zig has no destructors or garbage collector. `defer deinit()` is the language's idiomatic substitute. Enforcing this pattern consistently means memory and connection leaks are visible at review time (the call site has no `defer`) rather than at runtime.
 
@@ -170,9 +200,9 @@ The internal module structure (`src/cqrs.zig`, `src/event_store.zig`, and so on)
 const libpq = @import("libpq_mock.zig");
 ```
 
-Swapping to a real connection requires changing this one import to `@import("libpq.zig")` and linking libpq in `build.zig`. The `Connection`, `ConnectionPool`, and `Transaction` code is identical in both cases — it calls `libpq.PQconnectdb(...)`, `libpq.PQexecParams(...)`, and so on, without knowing which implementation is behind the module name.
+Swapping to a real connection requires changing this one import to `@import("libpq.zig")` and linking libpq in `build.zig`. The `Connection`, `ConnectionPool`, and `Transaction` code is identical in both cases; it calls `libpq.PQconnectdb(...)`, `libpq.PQexecParams(...)`, and so on, without knowing which implementation is behind the module name.
 
-**Why:** This is how CI stays hermetic. The mock always returns `null` from `PQconnectdb` and `CONNECTION_BAD` from `PQstatus`, which makes every connection attempt fail predictably. Tests exercise error propagation through the pool and adapter layers without needing a running PostgreSQL instance. The swap to the real backend is mechanical and auditable — one line changed, one linker flag added.
+**Why:** This is how CI stays hermetic. The mock always returns `null` from `PQconnectdb` and `CONNECTION_BAD` from `PQstatus`, which makes every connection attempt fail predictably. Tests exercise error propagation through the pool and adapter layers without needing a running PostgreSQL instance. The swap to the real backend is mechanical and auditable: one line changed, one linker flag added.
 
 ---
 
@@ -185,7 +215,7 @@ Swapping to a real connection requires changing this one import to `@import("lib
 **How it appears here:**  
 `libpq_mock.zig` implements every libpq function with safe-but-failing behavior: `PQconnectdb` returns `null`, `PQstatus` returns `CONNECTION_BAD`, `PQresultStatus` returns `PGRES_FATAL_ERROR`, `PQclear` is a no-op. The calling code in `postgres_pool.zig` never needs to check "is this the mock or the real library?" It just calls the functions and handles the errors they return.
 
-**Why:** The alternative — conditional compilation or `if (is_test)` branches — pollutes the production code path with test concerns. The Null Object keeps the production code clean and lets tests verify that errors propagate correctly.
+**Why:** Conditional compilation or `if (is_test)` branches would pollute the production code path with test concerns. The Null Object keeps the production code clean and lets tests verify that errors propagate correctly.
 
 ---
 

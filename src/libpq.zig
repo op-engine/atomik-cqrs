@@ -1,6 +1,7 @@
-// C bindings for libpq (PostgreSQL C API)
-// Generated for Phase 2: Database Operations
-// Used to call PostgreSQL from Zig with real database operations
+// C bindings for libpq (PostgreSQL C API).
+// Drop-in replacement for libpq_mock.zig; same exported symbols, real calls.
+// To activate: change the import in postgres_pool.zig to "libpq.zig" and
+// link libpq in build.zig. See ADR-07 in docs/adr/decisions.md.
 
 const c = @cImport({
     @cInclude("libpq-fe.h");

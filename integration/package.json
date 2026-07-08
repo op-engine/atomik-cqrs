@@ -1,0 +1,10 @@
+{
+  "name": "atomik-cqrs-integration",
+  "private": true,
+  "scripts": {
+    "test": "bun run run.ts"
+  },
+  "dependencies": {
+    "neon-new": "latest"
+  }
+}

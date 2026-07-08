@@ -3,7 +3,7 @@ import wasmBytes from '../zig-out/wasm/atomik-cqrs-edge-harness.wasm';
 let exports_ = null;
 
 // Provided to the WASM module as `env.fill_random_bytes`. Called by
-// `cqrs.generate_uuid()` — writes `len` cryptographically secure random bytes
+// `cqrs.generate_uuid()`; writes `len` cryptographically secure random bytes
 // into WASM linear memory at `ptr` using the Workers Web Crypto API.
 const wasmImports = {
   env: {

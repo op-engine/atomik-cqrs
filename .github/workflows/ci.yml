@@ -46,3 +46,48 @@ jobs:
 
       - name: Build migration tool
         run: zig build migrate
+
+  integration:
+    name: Integration tests (Postgres 17)
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: atomik_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      ATOMIK_DATABASE_URL: postgres://postgres:postgres@localhost:5432/atomik_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-integration-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: zig-integration-
+
+      - name: Install libpq
+        run: sudo apt-get install -y libpq-dev
+
+      - name: Run integration tests
+        run: zig build test-integration --summary all

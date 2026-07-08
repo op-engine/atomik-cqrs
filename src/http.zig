@@ -95,3 +95,19 @@ test "json_response passes the body through unwrapped" {
 
     try std.testing.expectEqualStrings("{\"raw\":true}", response.body);
 }
+
+test "HttpResponse to_string formats a valid HTTP/1.1 wire response" {
+    const allocator = std.testing.allocator;
+    const response = HttpResponse{
+        .status_code = 404,
+        .content_type = "application/json",
+        .body = "not found",
+    };
+
+    const wire = try response.to_string(allocator);
+    defer allocator.free(wire);
+
+    // "not found" is 9 bytes; Content-Length must match exactly.
+    const expected = "HTTP/1.1 404\r\nContent-Type: application/json\r\nContent-Length: 9\r\n\r\nnot found";
+    try std.testing.expectEqualStrings(expected, wire);
+}

@@ -8,7 +8,7 @@
 const std = @import("std");
 const atomik = @import("atomik-cqrs");
 
-// Fixed-size heap — no OS allocator available in freestanding WASM.
+// Fixed-size heap; no OS allocator available in freestanding WASM.
 var heap: [256 * 1024]u8 = undefined;
 var fba = std.heap.FixedBufferAllocator.init(&heap);
 
@@ -134,8 +134,15 @@ fn append_demo_event(allocator: std.mem.Allocator, body: []const u8) !RouteResul
     return .{ .status = 200, .body = serialized };
 }
 
-/// Minimal in-memory EventStoreAdapter, scoped to a single request - there
-/// is no real database reachable from this demo.
+/// Minimal in-memory EventStoreAdapter scoped to a single request.
+///
+/// Intentional simplifications; do NOT copy these into a real adapter:
+///   • get_events_impl ignores tenant_id and aggregate_type. Safe here because
+///     the store is created fresh per request and reset after the response is
+///     written, so it never holds data from more than one tenant. A real adapter
+///     MUST filter on all three dimensions (tenant_id, aggregate_id, aggregate_type).
+///   • No OCC enforcement; version uniqueness is not checked on append.
+///   • No idempotency storage; find/store are no-ops.
 const InMemoryDemoStore = struct {
     allocator: std.mem.Allocator,
     events: std.ArrayList(atomik.cqrs.DomainEvent),

@@ -36,10 +36,59 @@ pub fn main() !void {
 
     try ensure_migrations_table(conn);
 
-    // TODO: Read migration files from ./migrations and apply pending ones
-    // in filename order (see apply_migration/record_migration below).
-    std.debug.print("No migrations found\n", .{});
-    std.debug.print("\nMigration tool initialized.\n", .{});
+    // Collect all *.sql files in ./migrations in sorted filename order.
+    var dir = std.fs.cwd().openDir("migrations", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("No migrations/ directory found — nothing to do.\n", .{});
+            return;
+        },
+        else => return err,
+    };
+    defer dir.close();
+
+    var filenames = std.ArrayList([]const u8).init(allocator);
+    defer {
+        for (filenames.items) |name| allocator.free(name);
+        filenames.deinit();
+    }
+
+    var dir_iter = dir.iterate();
+    while (try dir_iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
+        try filenames.append(try allocator.dupe(u8, entry.name));
+    }
+
+    if (filenames.items.len == 0) {
+        std.debug.print("No .sql files found in migrations/ — nothing to do.\n", .{});
+        return;
+    }
+
+    std.mem.sort([]const u8, filenames.items, {}, compare_migration_names);
+
+    var applied_count: usize = 0;
+    var skipped_count: usize = 0;
+
+    for (filenames.items) |filename| {
+        if (try is_migration_applied(conn, filename)) {
+            std.debug.print("  skip  {s}\n", .{filename});
+            skipped_count += 1;
+            continue;
+        }
+
+        std.debug.print("  apply {s} ...", .{filename});
+
+        const sql_content = try dir.readFileAlloc(allocator, filename, 4 * 1024 * 1024);
+        defer allocator.free(sql_content);
+
+        try apply_migration(conn, sql_content);
+        try record_migration(conn, filename);
+
+        std.debug.print(" ok\n", .{});
+        applied_count += 1;
+    }
+
+    std.debug.print("\nApplied {d} migration(s), skipped {d}.\n", .{ applied_count, skipped_count });
 }
 
 /// Ensure schema_migrations table exists

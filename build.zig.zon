@@ -9,5 +9,12 @@
         "build.zig.zon",
         "src",
         "README.md",
+        "LICENSE",
+        "SECURITY.md",
+        "CONTRIBUTING.md",
+        "DESIGN_PATTERNS.md",
+        "RELEASE_NOTES.md",
+        "docs",
+        "migrations",
     },
 }

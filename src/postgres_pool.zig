@@ -9,7 +9,34 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const libpq = @import("libpq_mock.zig");
+const libpq = @import("libpq");
+
+const cqrs = @import("cqrs.zig");
+
+/// Encode a UUID as a 32-character lowercase hex string for VARCHAR(32) columns.
+/// Both the PostgresAdapter and EventRepository use this encoding; keeping it
+/// here prevents the two copies from diverging.
+pub fn uuid_to_hex(allocator: Allocator, uuid: cqrs.UUID) ![]const u8 {
+    const hex_chars = "0123456789abcdef";
+    const hex = try allocator.alloc(u8, 32);
+    for (uuid, 0..) |byte, i| {
+        hex[i * 2] = hex_chars[byte >> 4];
+        hex[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+    return hex;
+}
+
+/// Decode a 32-character lowercase hex string back into a UUID.
+pub fn hex_to_uuid(hex: []const u8) !cqrs.UUID {
+    if (hex.len != 32) return error.InvalidHex;
+    var uuid: cqrs.UUID = undefined;
+    for (0..16) |i| {
+        const hi = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 1], 16);
+        const lo = try std.fmt.parseInt(u8, hex[i * 2 + 1 .. i * 2 + 2], 16);
+        uuid[i] = (hi << 4) | lo;
+    }
+    return uuid;
+}
 
 pub const PgError = error{
     ConnectionFailed,
@@ -19,6 +46,7 @@ pub const PgError = error{
     NoRows,
     TooManyRows,
     InvalidParameter,
+    NotImplemented,
     ServerError,
     OutOfMemory,
 };
@@ -87,8 +115,8 @@ pub const Connection = struct {
     pub fn init(allocator: Allocator, database_url: []const u8) !Connection {
         const conn_cstr = try allocator.dupeZ(u8, database_url);
         defer {
-            // Zero the DSN — it may contain a password — before returning the
-            // memory to the allocator.
+            // Zero the DSN before returning the memory to the allocator;
+            // it may contain a password.
             @memset(conn_cstr, 0);
             allocator.free(conn_cstr);
         }
@@ -316,7 +344,7 @@ pub const ConnectionPool = struct {
             conn.deinit();
         }
         self.allocator.free(self.connections);
-        // Zero the DSN before freeing — it may contain a password.
+        // Zero the DSN before freeing; it may contain a password.
         @memset(self.database_url, 0);
         self.allocator.free(self.database_url);
     }
@@ -324,7 +352,7 @@ pub const ConnectionPool = struct {
     /// Get a connection from the pool. Thread-safe for initialization.
     ///
     /// NOTE: once the pool is full, all callers share connections[0]. The mutex
-    /// only protects the init path — concurrent callers will use the same
+    /// only protects the init path; concurrent callers will use the same
     /// Connection without synchronization. This is safe only for single-threaded
     /// use cases (e.g., WASM workers handling one request at a time). Before
     /// adding multi-threaded callers, replace with a semaphore-guarded queue
@@ -359,21 +387,18 @@ pub const ConnectionUrl = struct {
     password: []const u8,
     database: []const u8,
 
+    /// NOT IMPLEMENTED. Returns error.NotImplemented on every call.
+    ///
+    /// ConnectionPool.init takes the raw DSN string and passes it directly
+    /// to PQconnectdb; no parsing is required for the connection flow.
+    /// This function exists as a placeholder for callers that need the
+    /// individual fields (host, port, etc.) extracted. Implement it or
+    /// remove it before exposing it to consumers; calling it currently
+    /// returns an error rather than silently connecting to the wrong database.
     pub fn parse(allocator: Allocator, url: []const u8) !ConnectionUrl {
         _ = allocator;
-
-        if (!std.mem.startsWith(u8, url, "postgres://")) {
-            return PgError.InvalidParameter;
-        }
-
-        // TODO: Parse host/port/user/password/database out of `url`.
-        return ConnectionUrl{
-            .host = "localhost",
-            .port = 5432,
-            .user = "postgres",
-            .password = "",
-            .database = "postgres",
-        };
+        _ = url;
+        return PgError.NotImplemented;
     }
 };
 
@@ -409,17 +434,15 @@ pub const Transaction = struct {
 // TESTS
 // ============================================================================
 
-test "ConnectionUrl.parse rejects non-postgres schemes" {
+test "ConnectionUrl.parse returns NotImplemented (stub, not yet wired)" {
     try std.testing.expectError(
-        PgError.InvalidParameter,
+        PgError.NotImplemented,
+        ConnectionUrl.parse(std.testing.allocator, "postgres://localhost/db"),
+    );
+    try std.testing.expectError(
+        PgError.NotImplemented,
         ConnectionUrl.parse(std.testing.allocator, "mysql://localhost/db"),
     );
-}
-
-test "ConnectionUrl.parse accepts a postgres:// url" {
-    const parsed = try ConnectionUrl.parse(std.testing.allocator, "postgres://localhost/db");
-    try std.testing.expectEqualStrings("localhost", parsed.host);
-    try std.testing.expectEqual(@as(u16, 5432), parsed.port);
 }
 
 test "ConnectionPool.get_connection surfaces the mock backend's connection failure" {

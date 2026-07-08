@@ -9,6 +9,14 @@ const Allocator = std.mem.Allocator;
 const event_store = @import("../event_store.zig");
 const cqrs = @import("../cqrs.zig");
 const postgres_pool = @import("../postgres_pool.zig");
+const projection = @import("../projection.zig");
+
+// std.time.milliTimestamp was removed in Zig 0.16; use POSIX clock_gettime.
+fn nowMillis() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
 
 pub const PostgresAdapter = struct {
     allocator: Allocator,
@@ -34,32 +42,6 @@ pub const PostgresAdapter = struct {
     }
 
     // ========================================================================
-    // HELPERS
-    // ========================================================================
-
-    fn uuid_to_hex(allocator: Allocator, uuid: cqrs.UUID) ![]const u8 {
-        const hex_chars = "0123456789abcdef";
-        const hex = try allocator.alloc(u8, 32);
-        for (uuid, 0..) |byte, i| {
-            hex[i * 2] = hex_chars[byte >> 4];
-            hex[i * 2 + 1] = hex_chars[byte & 0x0f];
-        }
-        return hex;
-    }
-
-    fn hex_to_uuid(hex: []const u8) !cqrs.UUID {
-        var uuid: cqrs.UUID = undefined;
-        if (hex.len != 32) return error.InvalidHex;
-
-        for (0..16) |i| {
-            const hi = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 1], 16);
-            const lo = try std.fmt.parseInt(u8, hex[i * 2 + 1 .. i * 2 + 2], 16);
-            uuid[i] = (hi << 4) | lo;
-        }
-        return uuid;
-    }
-
-    // ========================================================================
     // SCHEMA
     // ========================================================================
 
@@ -70,6 +52,7 @@ pub const PostgresAdapter = struct {
 
         const sql =
             \\CREATE TABLE IF NOT EXISTS events (
+            \\  global_seq BIGSERIAL NOT NULL,
             \\  id VARCHAR(32) PRIMARY KEY,
             \\  tenant_id VARCHAR(32) NOT NULL,
             \\  aggregate_id VARCHAR(32) NOT NULL,
@@ -83,6 +66,7 @@ pub const PostgresAdapter = struct {
             \\);
             \\CREATE UNIQUE INDEX IF NOT EXISTS idx_events_aggregate ON events(tenant_id, aggregate_id, version ASC);
             \\CREATE INDEX IF NOT EXISTS idx_events_type ON events(tenant_id, aggregate_type, event_type, timestamp DESC);
+            \\CREATE INDEX IF NOT EXISTS idx_events_global_seq ON events(global_seq ASC);
             \\
             \\CREATE TABLE IF NOT EXISTS idempotency_keys (
             \\  tenant_id VARCHAR(32) NOT NULL,
@@ -103,6 +87,23 @@ pub const PostgresAdapter = struct {
             \\  timestamp BIGINT NOT NULL
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_logs(tenant_id, timestamp DESC);
+            \\
+            \\CREATE TABLE IF NOT EXISTS projection_checkpoints (
+            \\  name VARCHAR(256) PRIMARY KEY,
+            \\  position BIGINT NOT NULL DEFAULT 0,
+            \\  updated_at BIGINT NOT NULL DEFAULT 0
+            \\);
+            \\
+            \\CREATE TABLE IF NOT EXISTS snapshots (
+            \\  id BIGSERIAL PRIMARY KEY,
+            \\  tenant_id VARCHAR(32) NOT NULL,
+            \\  aggregate_id VARCHAR(32) NOT NULL,
+            \\  aggregate_type VARCHAR(128) NOT NULL,
+            \\  version INT NOT NULL,
+            \\  state JSONB NOT NULL,
+            \\  created_at BIGINT NOT NULL,
+            \\  UNIQUE (tenant_id, aggregate_id)
+            \\);
         ;
 
         _ = try conn.exec(sql, &[_][]const u8{});
@@ -125,7 +126,7 @@ pub const PostgresAdapter = struct {
         var txn = try postgres_pool.Transaction.init(conn);
         defer txn.deinit();
 
-        const tenant_hex = try uuid_to_hex(allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(allocator, tenant_id);
         defer allocator.free(tenant_hex);
 
         const sql =
@@ -137,11 +138,11 @@ pub const PostgresAdapter = struct {
         ;
 
         for (events) |event| {
-            const id_hex = try uuid_to_hex(allocator, event.event_id);
+            const id_hex = try postgres_pool.uuid_to_hex(allocator, event.event_id);
             defer allocator.free(id_hex);
-            const aggregate_id_hex = try uuid_to_hex(allocator, event.aggregate_id);
+            const aggregate_id_hex = try postgres_pool.uuid_to_hex(allocator, event.aggregate_id);
             defer allocator.free(aggregate_id_hex);
-            const user_id_hex = try uuid_to_hex(allocator, event.user_id);
+            const user_id_hex = try postgres_pool.uuid_to_hex(allocator, event.user_id);
             defer allocator.free(user_id_hex);
 
             const version_str = try std.fmt.allocPrint(allocator, "{d}", .{event.version});
@@ -149,7 +150,7 @@ pub const PostgresAdapter = struct {
             const timestamp_str = try std.fmt.allocPrint(allocator, "{d}", .{event.timestamp});
             defer allocator.free(timestamp_str);
 
-            conn.exec(sql, &[_][]const u8{
+            _ = conn.exec(sql, &[_][]const u8{
                 id_hex,
                 tenant_hex,
                 aggregate_id_hex,
@@ -170,17 +171,19 @@ pub const PostgresAdapter = struct {
     }
 
     fn row_to_event(allocator: Allocator, row: postgres_pool.Row) !cqrs.DomainEvent {
-        // Column order: id, tenant_id, aggregate_id, aggregate_type, event_type, event_data, version, timestamp, created_by
+        // Column order: id, tenant_id, aggregate_id, aggregate_type, event_type,
+        //               event_data, version, timestamp, created_by, global_seq
         return cqrs.DomainEvent{
-            .event_id = try hex_to_uuid(row.values[0] orelse return error.MissingColumn),
-            .tenant_id = try hex_to_uuid(row.values[1] orelse return error.MissingColumn),
-            .aggregate_id = try hex_to_uuid(row.values[2] orelse return error.MissingColumn),
+            .event_id = try postgres_pool.hex_to_uuid(row.values[0] orelse return error.MissingColumn),
+            .tenant_id = try postgres_pool.hex_to_uuid(row.values[1] orelse return error.MissingColumn),
+            .aggregate_id = try postgres_pool.hex_to_uuid(row.values[2] orelse return error.MissingColumn),
             .aggregate_type = try allocator.dupe(u8, row.values[3] orelse return error.MissingColumn),
             .event_type = try allocator.dupe(u8, row.values[4] orelse return error.MissingColumn),
             .data = try allocator.dupe(u8, row.values[5] orelse return error.MissingColumn),
             .version = try std.fmt.parseInt(u32, row.values[6] orelse return error.MissingColumn, 10),
             .timestamp = try std.fmt.parseInt(i64, row.values[7] orelse return error.MissingColumn, 10),
-            .user_id = try hex_to_uuid(row.values[8] orelse return error.MissingColumn),
+            .user_id = try postgres_pool.hex_to_uuid(row.values[8] orelse return error.MissingColumn),
+            .global_seq = try std.fmt.parseInt(u64, row.values[9] orelse return error.MissingColumn, 10),
         };
     }
 
@@ -190,24 +193,27 @@ pub const PostgresAdapter = struct {
         tenant_id: cqrs.UUID,
         aggregate_id: cqrs.UUID,
         aggregate_type: []const u8,
+        after_version: u32,
     ) anyerror![]cqrs.DomainEvent {
         const self: *PostgresAdapter = @ptrCast(@alignCast(ctx));
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
         const sql =
-            \\SELECT id, tenant_id, aggregate_id, aggregate_type, event_type, event_data, version, timestamp, created_by
+            \\SELECT id, tenant_id, aggregate_id, aggregate_type, event_type, event_data, version, timestamp, created_by, global_seq
             \\FROM events
-            \\WHERE tenant_id = $1 AND aggregate_id = $2 AND aggregate_type = $3
+            \\WHERE tenant_id = $1 AND aggregate_id = $2 AND aggregate_type = $3 AND version > $4
             \\ORDER BY version ASC
         ;
 
-        const tenant_hex = try uuid_to_hex(allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(allocator, tenant_id);
         defer allocator.free(tenant_hex);
-        const aggregate_id_hex = try uuid_to_hex(allocator, aggregate_id);
+        const aggregate_id_hex = try postgres_pool.uuid_to_hex(allocator, aggregate_id);
         defer allocator.free(aggregate_id_hex);
+        const after_version_str = try std.fmt.allocPrint(allocator, "{d}", .{after_version});
+        defer allocator.free(after_version_str);
 
-        var result = try conn.query(sql, &[_][]const u8{ tenant_hex, aggregate_id_hex, aggregate_type });
+        var result = try conn.query(sql, &[_][]const u8{ tenant_hex, aggregate_id_hex, aggregate_type, after_version_str });
         defer result.deinit();
 
         var out: std.ArrayList(cqrs.DomainEvent) = .empty;
@@ -227,14 +233,14 @@ pub const PostgresAdapter = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const tenant_hex = try uuid_to_hex(allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(allocator, tenant_id);
         defer allocator.free(tenant_hex);
 
         var sql_buf: std.ArrayList(u8) = .empty;
         defer sql_buf.deinit(allocator);
         try sql_buf.appendSlice(
             allocator,
-            "SELECT id, tenant_id, aggregate_id, aggregate_type, event_type, event_data, version, timestamp, created_by " ++
+            "SELECT id, tenant_id, aggregate_id, aggregate_type, event_type, event_data, version, timestamp, created_by, global_seq " ++
                 "FROM events WHERE tenant_id = $1",
         );
 
@@ -242,6 +248,12 @@ pub const PostgresAdapter = struct {
         defer args.deinit(allocator);
         try args.append(allocator, tenant_hex);
 
+        var after_seq_buf: [24]u8 = undefined;
+        if (filters.after_seq) |seq| {
+            const s = try std.fmt.bufPrint(&after_seq_buf, "{d}", .{seq});
+            try args.append(allocator, s);
+            try sql_buf.print(allocator, " AND global_seq > ${d}", .{args.items.len});
+        }
         if (filters.aggregate_type) |at| {
             try args.append(allocator, at);
             try sql_buf.print(allocator, " AND aggregate_type = ${d}", .{args.items.len});
@@ -264,7 +276,7 @@ pub const PostgresAdapter = struct {
             try sql_buf.print(allocator, " AND timestamp <= ${d}", .{args.items.len});
         }
 
-        try sql_buf.appendSlice(allocator, " ORDER BY timestamp ASC");
+        try sql_buf.appendSlice(allocator, " ORDER BY global_seq ASC");
 
         var limit_buf: [16]u8 = undefined;
         if (filters.limit) |limit| {
@@ -297,7 +309,7 @@ pub const PostgresAdapter = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const tenant_hex = try uuid_to_hex(allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(allocator, tenant_id);
         defer allocator.free(tenant_hex);
 
         const sql =
@@ -327,7 +339,7 @@ pub const PostgresAdapter = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const tenant_hex = try uuid_to_hex(allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(allocator, tenant_id);
         defer allocator.free(tenant_hex);
 
         const created_at_str = try std.fmt.allocPrint(allocator, "{d}", .{result.created_at});
@@ -354,6 +366,156 @@ pub const PostgresAdapter = struct {
 };
 
 // ============================================================================
+// POSTGRES CHECKPOINT STORE
+// ============================================================================
+
+/// PostgreSQL-backed CheckpointStore for production projection deployments.
+/// Persists checkpoints in the `projection_checkpoints` table (created by
+/// `PostgresAdapter.create_schema`). Obtain one with `to_store()`.
+pub const PostgresCheckpointStore = struct {
+    allocator: Allocator,
+    pool: *postgres_pool.ConnectionPool,
+
+    pub fn init(allocator: Allocator, pool: *postgres_pool.ConnectionPool) PostgresCheckpointStore {
+        return .{ .allocator = allocator, .pool = pool };
+    }
+
+    pub fn to_store(self: *PostgresCheckpointStore) projection.CheckpointStore {
+        return .{
+            .ctx = self,
+            .load_fn = load_impl,
+            .save_fn = save_impl,
+            .deinit_fn = deinit_impl,
+        };
+    }
+
+    fn load_impl(ctx: *anyopaque, allocator: Allocator, name: []const u8) anyerror!u64 {
+        _ = allocator;
+        const self: *PostgresCheckpointStore = @ptrCast(@alignCast(ctx));
+        const conn = try self.pool.get_connection();
+        defer self.pool.release_connection(conn);
+
+        var result = try conn.query(
+            "SELECT position FROM projection_checkpoints WHERE name = $1",
+            &[_][]const u8{name},
+        );
+        defer result.deinit();
+
+        const row = result.first() orelse return 0;
+        return std.fmt.parseInt(u64, row.values[0] orelse return 0, 10) catch 0;
+    }
+
+    fn save_impl(ctx: *anyopaque, name: []const u8, position: u64) anyerror!void {
+        const self: *PostgresCheckpointStore = @ptrCast(@alignCast(ctx));
+        const conn = try self.pool.get_connection();
+        defer self.pool.release_connection(conn);
+
+        const pos_str = try std.fmt.allocPrint(self.allocator, "{d}", .{position});
+        defer self.allocator.free(pos_str);
+        const now_str = try std.fmt.allocPrint(self.allocator, "{d}", .{nowMillis()});
+        defer self.allocator.free(now_str);
+
+        _ = try conn.exec(
+            \\INSERT INTO projection_checkpoints (name, position, updated_at)
+            \\VALUES ($1, $2, $3)
+            \\ON CONFLICT (name) DO UPDATE SET position = EXCLUDED.position, updated_at = EXCLUDED.updated_at
+        ,
+            &[_][]const u8{ name, pos_str, now_str },
+        );
+    }
+
+    fn deinit_impl(ctx: *anyopaque) void {
+        _ = ctx;
+    }
+};
+
+// ============================================================================
+// SNAPSHOT STORE
+// ============================================================================
+
+/// PostgreSQL-backed SnapshotStore. One row per (tenant_id, aggregate_id);
+/// saving a newer snapshot replaces the old one via ON CONFLICT DO UPDATE.
+pub const PostgresSnapshotStore = struct {
+    allocator: Allocator,
+    pool: *postgres_pool.ConnectionPool,
+
+    pub fn init(allocator: Allocator, pool: *postgres_pool.ConnectionPool) PostgresSnapshotStore {
+        return .{ .allocator = allocator, .pool = pool };
+    }
+
+    pub fn to_store(self: *PostgresSnapshotStore) event_store.SnapshotStore {
+        return .{
+            .allocator = self.allocator,
+            .context = self,
+            .load_fn = load_impl,
+            .save_fn = save_impl,
+            .deinit_fn = deinit_impl,
+        };
+    }
+
+    fn load_impl(ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, aggregate_id: cqrs.UUID, aggregate_type: []const u8) anyerror!?cqrs.Snapshot {
+        const self: *PostgresSnapshotStore = @ptrCast(@alignCast(ctx));
+        const conn = try self.pool.get_connection();
+        defer self.pool.release_connection(conn);
+
+        const tenant_hex = try postgres_pool.uuid_to_hex(allocator, tenant_id);
+        defer allocator.free(tenant_hex);
+        const agg_hex = try postgres_pool.uuid_to_hex(allocator, aggregate_id);
+        defer allocator.free(agg_hex);
+
+        var result = try conn.query(
+            \\SELECT aggregate_type, version, state, created_at
+            \\FROM snapshots
+            \\WHERE tenant_id = $1 AND aggregate_id = $2
+        ,
+            &[_][]const u8{ tenant_hex, agg_hex },
+        );
+        defer result.deinit();
+
+        const row = result.first() orelse return null;
+        _ = aggregate_type; // the caller provides this for type-safety; DB is the source of truth
+        return cqrs.Snapshot{
+            .aggregate_id = aggregate_id,
+            .aggregate_type = try allocator.dupe(u8, row.values[0] orelse return error.MissingColumn),
+            .version = try std.fmt.parseInt(u32, row.values[1] orelse return error.MissingColumn, 10),
+            .state = try allocator.dupe(u8, row.values[2] orelse return error.MissingColumn),
+            .created_at = try std.fmt.parseInt(i64, row.values[3] orelse return error.MissingColumn, 10),
+        };
+    }
+
+    fn save_impl(ctx: *anyopaque, tenant_id: cqrs.UUID, snapshot: cqrs.Snapshot) anyerror!void {
+        const self: *PostgresSnapshotStore = @ptrCast(@alignCast(ctx));
+        const conn = try self.pool.get_connection();
+        defer self.pool.release_connection(conn);
+
+        const tenant_hex = try postgres_pool.uuid_to_hex(self.allocator, tenant_id);
+        defer self.allocator.free(tenant_hex);
+        const agg_hex = try postgres_pool.uuid_to_hex(self.allocator, snapshot.aggregate_id);
+        defer self.allocator.free(agg_hex);
+        const version_str = try std.fmt.allocPrint(self.allocator, "{d}", .{snapshot.version});
+        defer self.allocator.free(version_str);
+        const created_at_str = try std.fmt.allocPrint(self.allocator, "{d}", .{snapshot.created_at});
+        defer self.allocator.free(created_at_str);
+
+        _ = try conn.exec(
+            \\INSERT INTO snapshots (tenant_id, aggregate_id, aggregate_type, version, state, created_at)
+            \\VALUES ($1, $2, $3, $4, $5, $6)
+            \\ON CONFLICT (tenant_id, aggregate_id)
+            \\DO UPDATE SET aggregate_type = EXCLUDED.aggregate_type,
+            \\              version = EXCLUDED.version,
+            \\              state = EXCLUDED.state,
+            \\              created_at = EXCLUDED.created_at
+        ,
+            &[_][]const u8{ tenant_hex, agg_hex, snapshot.aggregate_type, version_str, snapshot.state, created_at_str },
+        );
+    }
+
+    fn deinit_impl(ctx: *anyopaque) void {
+        _ = ctx;
+    }
+};
+
+// ============================================================================
 // TESTS
 // ============================================================================
 // libpq_mock always refuses to connect, so these confirm the adapter wires
@@ -363,6 +525,11 @@ pub const PostgresAdapter = struct {
 const std_testing = std.testing;
 
 test "PostgresAdapter.to_adapter satisfies the EventStoreAdapter shape" {
+    // This test exercises the mock libpq path (connection always fails).
+    // Skip when a real database URL is present so it doesn't interfere
+    // with the integration test suite which uses actual libpq.
+    if (std.c.getenv("ATOMIK_DATABASE_URL") != null) return error.SkipZigTest;
+
     var pool = try postgres_pool.ConnectionPool.init(std_testing.allocator, "postgres://localhost/db", 1);
     defer pool.deinit();
 

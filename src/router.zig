@@ -1,4 +1,4 @@
-//! HTTP Router — request routing and path parsing. Domain-agnostic:
+//! HTTP Router: request routing and path parsing. Domain-agnostic:
 //! reusable by any application built on this library.
 
 const std = @import("std");

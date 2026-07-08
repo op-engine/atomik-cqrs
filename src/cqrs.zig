@@ -1,4 +1,4 @@
-//! CQRS Framework — Command Query Responsibility Segregation on top of
+//! CQRS Framework: Command Query Responsibility Segregation on top of
 //! event sourcing. Domain-agnostic: aggregate/event/command "type" fields
 //! are open string discriminators, not closed enums, so a consuming
 //! application defines its own vocabulary without modifying this module.
@@ -42,6 +42,10 @@ pub const DomainEvent = struct {
     timestamp: i64,
     user_id: UUID,
     data: []const u8, // JSON payload
+    /// Monotonically increasing position assigned by the store at write time.
+    /// Used as the projection cursor. 0 when not backed by a sequenced store
+    /// (in-memory stores assign 1-based values; WASM resets on restart).
+    global_seq: u64 = 0,
 };
 
 /// Audit event envelope. `event_type` is application-defined (e.g. "DATA_EXPORTED").
@@ -65,11 +69,26 @@ pub const QueryFilters = struct {
     start_time: ?i64 = null,
     end_time: ?i64 = null,
     limit: ?u32 = null,
+    /// Projection cursor: return only events whose global_seq is strictly
+    /// greater than this value, ordered by global_seq ASC. Set automatically
+    /// by ProjectionRunner; leave null for non-projection queries.
+    after_seq: ?u64 = null,
 };
 
 pub const IdempotencyResult = struct {
     command_type: []const u8,
     result: []const u8, // JSON
+    created_at: i64,
+};
+
+/// A point-in-time capture of an aggregate's state at a given version.
+/// Used by SnapshotStore to skip replaying events that are already reflected
+/// in the snapshot. `state` is application-serialized (typically JSON).
+pub const Snapshot = struct {
+    aggregate_id: UUID,
+    aggregate_type: []const u8,
+    version: u32,
+    state: []const u8,
     created_at: i64,
 };
 
@@ -113,6 +132,28 @@ pub const Aggregate = struct {
             self.version = event.version;
         }
     }
+
+    /// Hydrate from a snapshot (if any) then replay incremental events.
+    /// Caller should fetch events via `adapter.get_events(..., after_version =
+    /// snapshot.version)` so only the events AFTER the snapshot are replayed.
+    /// `apply_snapshot_fn` deserializes the snapshot's `state` bytes into self;
+    /// pass null to skip snapshot restoration (treats snapshot as a version hint only).
+    pub fn load_from_history_with_snapshot(
+        self: *Aggregate,
+        snapshot: ?Snapshot,
+        events: []const DomainEvent,
+        apply_snapshot_fn: ?*const fn (self: *Aggregate, state: []const u8) anyerror!void,
+        apply_event_fn: *const fn (self: *Aggregate, event: DomainEvent) anyerror!void,
+    ) !void {
+        if (snapshot) |snap| {
+            if (apply_snapshot_fn) |f| try f(self, snap.state);
+            self.version = snap.version;
+        }
+        for (events) |event| {
+            try apply_event_fn(self, event);
+            self.version = event.version;
+        }
+    }
 };
 
 // ============================================================================
@@ -125,7 +166,7 @@ pub const Aggregate = struct {
 const is_wasm = @import("builtin").target.cpu.arch == .wasm32;
 
 const wasm_js = if (is_wasm) struct {
-    // Implemented in edge/worker.js — writes `len` cryptographically secure
+    // Implemented in edge/worker.js; writes `len` cryptographically secure
     // random bytes into the WASM linear memory starting at `ptr`.
     pub extern fn fill_random_bytes(ptr: [*]u8, len: usize) void;
 } else struct {};
@@ -150,7 +191,7 @@ fn fill_os_entropy(buf: []u8) void {
         const rc = std.os.linux.getrandom(buf.ptr, buf.len, 0);
         std.debug.assert(std.os.linux.getErrno(rc) == .SUCCESS);
     } else {
-        // macOS, iOS, BSDs — arc4random_buf is always available and never fails.
+        // macOS, iOS, BSDs: arc4random_buf is always available and never fails.
         std.c.arc4random_buf(buf.ptr, buf.len);
     }
 }
@@ -246,4 +287,97 @@ test "aggregate records uncommitted events and tracks version" {
 
     try std.testing.expectEqual(@as(u32, 1), agg.version);
     try std.testing.expectEqual(@as(usize, 1), agg.uncommitted_events.items.len);
+}
+
+test "aggregate load_from_history advances version to last event" {
+    var agg = Aggregate.init(std.testing.allocator, generate_uuid());
+    defer agg.deinit();
+
+    const history = [_]DomainEvent{
+        .{ .event_id = generate_uuid(), .aggregate_id = agg.aggregate_id, .aggregate_type = "Widget", .event_type = "WidgetCreated", .tenant_id = generate_uuid(), .version = 1, .timestamp = 0, .user_id = generate_uuid(), .data = "{}" },
+        .{ .event_id = generate_uuid(), .aggregate_id = agg.aggregate_id, .aggregate_type = "Widget", .event_type = "WidgetUpdated", .tenant_id = generate_uuid(), .version = 2, .timestamp = 0, .user_id = generate_uuid(), .data = "{}" },
+        .{ .event_id = generate_uuid(), .aggregate_id = agg.aggregate_id, .aggregate_type = "Widget", .event_type = "WidgetArchived", .tenant_id = generate_uuid(), .version = 3, .timestamp = 0, .user_id = generate_uuid(), .data = "{}" },
+    };
+
+    try agg.load_from_history(&history, struct {
+        fn apply(_: *Aggregate, _: DomainEvent) anyerror!void {}
+    }.apply);
+
+    try std.testing.expectEqual(@as(u32, 3), agg.version);
+    // load_from_history must not populate uncommitted_events.
+    try std.testing.expectEqual(@as(usize, 0), agg.uncommitted_events.items.len);
+}
+
+test "aggregate load_from_history calls apply_event for each event in order" {
+    // Concrete aggregate that records the sequence of event types it receives.
+    const WidgetAggregate = struct {
+        base: Aggregate,
+        seen: [8][]const u8 = undefined,
+        count: usize = 0,
+
+        fn apply(base: *Aggregate, event: DomainEvent) anyerror!void {
+            const self: *@This() = @fieldParentPtr("base", base);
+            self.seen[self.count] = event.event_type;
+            self.count += 1;
+        }
+    };
+
+    var agg = WidgetAggregate{ .base = Aggregate.init(std.testing.allocator, generate_uuid()) };
+    defer agg.base.deinit();
+
+    const history = [_]DomainEvent{
+        .{ .event_id = generate_uuid(), .aggregate_id = agg.base.aggregate_id, .aggregate_type = "Widget", .event_type = "WidgetCreated", .tenant_id = generate_uuid(), .version = 1, .timestamp = 0, .user_id = generate_uuid(), .data = "{}" },
+        .{ .event_id = generate_uuid(), .aggregate_id = agg.base.aggregate_id, .aggregate_type = "Widget", .event_type = "WidgetUpdated", .tenant_id = generate_uuid(), .version = 2, .timestamp = 0, .user_id = generate_uuid(), .data = "{}" },
+    };
+
+    try agg.base.load_from_history(&history, WidgetAggregate.apply);
+
+    try std.testing.expectEqual(@as(usize, 2), agg.count);
+    try std.testing.expectEqualStrings("WidgetCreated", agg.seen[0]);
+    try std.testing.expectEqualStrings("WidgetUpdated", agg.seen[1]);
+}
+
+test "aggregate load_from_history_with_snapshot restores state and replays only incremental events" {
+    const OrderAggregate = struct {
+        base: Aggregate,
+        // Simulated state fields populated by apply_snapshot.
+        total: u32 = 0,
+        shipped: bool = false,
+
+        fn apply_snapshot(base: *Aggregate, state: []const u8) anyerror!void {
+            const self: *@This() = @fieldParentPtr("base", base);
+            // Minimal parse: state is "{\"total\":N}" for this test.
+            if (std.mem.startsWith(u8, state, "{\"total\":")) {
+                const n_str = state[9 .. state.len - 1];
+                self.total = try std.fmt.parseInt(u32, n_str, 10);
+            }
+        }
+
+        fn apply_event(base: *Aggregate, event: DomainEvent) anyerror!void {
+            const self: *@This() = @fieldParentPtr("base", base);
+            if (std.mem.eql(u8, event.event_type, "OrderShipped")) self.shipped = true;
+        }
+    };
+
+    var agg = OrderAggregate{ .base = Aggregate.init(std.testing.allocator, generate_uuid()) };
+    defer agg.base.deinit();
+
+    // Snapshot captures state at version 5 — only version 6 needs to be replayed.
+    const snapshot = Snapshot{
+        .aggregate_id = agg.base.aggregate_id,
+        .aggregate_type = "Order",
+        .version = 5,
+        .state = "{\"total\":42}",
+        .created_at = 0,
+    };
+
+    const incremental = [_]DomainEvent{
+        .{ .event_id = generate_uuid(), .aggregate_id = agg.base.aggregate_id, .aggregate_type = "Order", .event_type = "OrderShipped", .tenant_id = generate_uuid(), .version = 6, .timestamp = 0, .user_id = generate_uuid(), .data = "{}" },
+    };
+
+    try agg.base.load_from_history_with_snapshot(snapshot, &incremental, OrderAggregate.apply_snapshot, OrderAggregate.apply_event);
+
+    try std.testing.expectEqual(@as(u32, 6), agg.base.version);
+    try std.testing.expectEqual(@as(u32, 42), agg.total);
+    try std.testing.expect(agg.shipped);
 }

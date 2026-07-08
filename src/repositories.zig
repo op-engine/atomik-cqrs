@@ -7,17 +7,7 @@ const Allocator = std.mem.Allocator;
 const cqrs = @import("cqrs.zig");
 const postgres_pool = @import("postgres_pool.zig");
 
-fn uuid_to_hex(allocator: Allocator, uuid: cqrs.UUID) ![]const u8 {
-    const hex_chars = "0123456789abcdef";
-    const hex = try allocator.alloc(u8, 32);
-    for (uuid, 0..) |byte, i| {
-        hex[i * 2] = hex_chars[byte >> 4];
-        hex[i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-    return hex;
-}
-
-/// Event Repository — Append-only event store access
+/// Event Repository: append-only event store access
 pub const EventRepository = struct {
     allocator: Allocator,
     pool: *postgres_pool.ConnectionPool,
@@ -41,7 +31,7 @@ pub const EventRepository = struct {
         var txn = try postgres_pool.Transaction.init(conn);
         defer txn.deinit();
 
-        const tenant_hex = try uuid_to_hex(self.allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(self.allocator, tenant_id);
         defer self.allocator.free(tenant_hex);
 
         const sql =
@@ -53,11 +43,11 @@ pub const EventRepository = struct {
         ;
 
         for (events) |event| {
-            const id_hex = try uuid_to_hex(self.allocator, event.event_id);
+            const id_hex = try postgres_pool.uuid_to_hex(self.allocator, event.event_id);
             defer self.allocator.free(id_hex);
-            const aggregate_id_hex = try uuid_to_hex(self.allocator, event.aggregate_id);
+            const aggregate_id_hex = try postgres_pool.uuid_to_hex(self.allocator, event.aggregate_id);
             defer self.allocator.free(aggregate_id_hex);
-            const user_id_hex = try uuid_to_hex(self.allocator, event.user_id);
+            const user_id_hex = try postgres_pool.uuid_to_hex(self.allocator, event.user_id);
             defer self.allocator.free(user_id_hex);
 
             const version_str = try std.fmt.allocPrint(self.allocator, "{d}", .{event.version});
@@ -92,9 +82,9 @@ pub const EventRepository = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const tenant_hex = try uuid_to_hex(self.allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(self.allocator, tenant_id);
         defer self.allocator.free(tenant_hex);
-        const aggregate_id_hex = try uuid_to_hex(self.allocator, aggregate_id);
+        const aggregate_id_hex = try postgres_pool.uuid_to_hex(self.allocator, aggregate_id);
         defer self.allocator.free(aggregate_id_hex);
 
         const sql =
@@ -116,7 +106,7 @@ pub const EventRepository = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const tenant_hex = try uuid_to_hex(self.allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(self.allocator, tenant_id);
         defer self.allocator.free(tenant_hex);
 
         const sql =
@@ -140,7 +130,7 @@ pub const EventRepository = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const tenant_hex = try uuid_to_hex(self.allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(self.allocator, tenant_id);
         defer self.allocator.free(tenant_hex);
 
         const created_at_str = try std.fmt.allocPrint(self.allocator, "{d}", .{result.created_at});
@@ -162,7 +152,7 @@ pub const EventRepository = struct {
     }
 };
 
-/// Audit Log Repository — Compliance logging
+/// Audit Log Repository: compliance logging
 pub const AuditLogRepository = struct {
     allocator: Allocator,
     pool: *postgres_pool.ConnectionPool,
@@ -182,11 +172,11 @@ pub const AuditLogRepository = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const id_hex = try uuid_to_hex(self.allocator, event.audit_event_id);
+        const id_hex = try postgres_pool.uuid_to_hex(self.allocator, event.audit_event_id);
         defer self.allocator.free(id_hex);
-        const tenant_hex = try uuid_to_hex(self.allocator, event.tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(self.allocator, event.tenant_id);
         defer self.allocator.free(tenant_hex);
-        const user_hex = try uuid_to_hex(self.allocator, event.user_id);
+        const user_hex = try postgres_pool.uuid_to_hex(self.allocator, event.user_id);
         defer self.allocator.free(user_hex);
 
         const sql =
@@ -220,7 +210,7 @@ pub const AuditLogRepository = struct {
         const conn = try self.pool.get_connection();
         defer self.pool.release_connection(conn);
 
-        const tenant_hex = try uuid_to_hex(self.allocator, tenant_id);
+        const tenant_hex = try postgres_pool.uuid_to_hex(self.allocator, tenant_id);
         defer self.allocator.free(tenant_hex);
 
         const sql =
