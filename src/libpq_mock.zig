@@ -94,6 +94,12 @@ pub fn PQcmdTuples(_: ?*const PGresult) [*:0]const u8 {
     return "0";
 }
 
+pub fn PQresultErrorField(_: ?*const PGresult, _: c_int) ?[*:0]const u8 {
+    return null;
+}
+
+pub const PG_DIAG_SQLSTATE: c_int = 'C';
+
 pub fn PQescapeString(_: [*]u8, _: [*:0]const u8, _: usize) usize {
     return 0;
 }

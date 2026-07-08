@@ -49,7 +49,7 @@ pub const PostgresAdapter = struct {
 
     fn hex_to_uuid(hex: []const u8) !cqrs.UUID {
         var uuid: cqrs.UUID = undefined;
-        if (hex.len < 32) return error.InvalidHex;
+        if (hex.len != 32) return error.InvalidHex;
 
         for (0..16) |i| {
             const hi = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 1], 16);
@@ -81,7 +81,7 @@ pub const PostgresAdapter = struct {
             \\  timestamp BIGINT NOT NULL,
             \\  created_by VARCHAR(32) NOT NULL
             \\);
-            \\CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(tenant_id, aggregate_id, version ASC);
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_events_aggregate ON events(tenant_id, aggregate_id, version ASC);
             \\CREATE INDEX IF NOT EXISTS idx_events_type ON events(tenant_id, aggregate_type, event_type, timestamp DESC);
             \\
             \\CREATE TABLE IF NOT EXISTS idempotency_keys (
@@ -149,7 +149,7 @@ pub const PostgresAdapter = struct {
             const timestamp_str = try std.fmt.allocPrint(allocator, "{d}", .{event.timestamp});
             defer allocator.free(timestamp_str);
 
-            _ = try conn.exec(sql, &[_][]const u8{
+            conn.exec(sql, &[_][]const u8{
                 id_hex,
                 tenant_hex,
                 aggregate_id_hex,
@@ -160,7 +160,10 @@ pub const PostgresAdapter = struct {
                 version_str,
                 timestamp_str,
                 user_id_hex,
-            });
+            }) catch |err| switch (err) {
+                postgres_pool.PgError.UniqueViolation => return error.OptimisticConcurrencyConflict,
+                else => return err,
+            };
         }
 
         try txn.commit();

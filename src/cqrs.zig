@@ -172,6 +172,10 @@ pub fn uuid_to_string(allocator: Allocator, uuid: UUID) ![]const u8 {
 /// Parse a canonical hyphenated hex UUID string back into bytes.
 pub fn string_to_uuid(str: []const u8) !UUID {
     if (str.len != 36) return error.InvalidUUID;
+    // Validate that hyphen positions match "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+    if (str[8] != '-' or str[13] != '-' or str[18] != '-' or str[23] != '-') {
+        return error.InvalidUUID;
+    }
     var uuid: UUID = undefined;
 
     for (0..16) |i| {
@@ -213,6 +217,15 @@ test "uuid round-trips through string form" {
 
 test "string_to_uuid rejects wrong length" {
     try std.testing.expectError(error.InvalidUUID, string_to_uuid("not-a-uuid"));
+}
+
+test "string_to_uuid rejects missing hyphens at correct positions" {
+    // 36 chars, valid hex throughout, but hyphens replaced with '0'
+    try std.testing.expectError(error.InvalidUUID, string_to_uuid("000000000000000000000000000000000000"));
+}
+
+test "string_to_uuid rejects wrong hyphen positions" {
+    try std.testing.expectError(error.InvalidUUID, string_to_uuid("0000000-00000-0000-0000-000000000000"));
 }
 
 test "aggregate records uncommitted events and tracks version" {

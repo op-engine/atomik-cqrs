@@ -10,6 +10,7 @@ pub const EventStoreError = error{
     AdapterNotInitialized,
     OperationFailed,
     SchemaCreationFailed,
+    OptimisticConcurrencyConflict,
 };
 
 /// Abstract event-store adapter. Implementations provide concrete storage
@@ -96,25 +97,38 @@ const InMemoryStore = struct {
     }
 
     fn get_events_impl(ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, aggregate_id: cqrs.UUID, aggregate_type: []const u8) anyerror![]cqrs.DomainEvent {
-        _ = tenant_id;
-        _ = aggregate_type;
         const self: *InMemoryStore = @ptrCast(@alignCast(ctx));
         var out: std.ArrayList(cqrs.DomainEvent) = .empty;
         for (self.events.items) |event| {
-            if (std.mem.eql(u8, &event.aggregate_id, &aggregate_id)) try out.append(allocator, event);
+            if (!std.mem.eql(u8, &event.tenant_id, &tenant_id)) continue;
+            if (!std.mem.eql(u8, &event.aggregate_id, &aggregate_id)) continue;
+            if (!std.mem.eql(u8, event.aggregate_type, aggregate_type)) continue;
+            try out.append(allocator, event);
         }
         return out.toOwnedSlice(allocator);
     }
 
     fn query_impl(ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, filters: cqrs.QueryFilters) anyerror![]cqrs.DomainEvent {
-        _ = tenant_id;
         const self: *InMemoryStore = @ptrCast(@alignCast(ctx));
         var out: std.ArrayList(cqrs.DomainEvent) = .empty;
         for (self.events.items) |event| {
+            if (!std.mem.eql(u8, &event.tenant_id, &tenant_id)) continue;
             if (filters.aggregate_type) |at| {
                 if (!std.mem.eql(u8, event.aggregate_type, at)) continue;
             }
+            if (filters.event_type) |et| {
+                if (!std.mem.eql(u8, event.event_type, et)) continue;
+            }
+            if (filters.start_time) |st| {
+                if (event.timestamp < st) continue;
+            }
+            if (filters.end_time) |et| {
+                if (event.timestamp > et) continue;
+            }
             try out.append(allocator, event);
+            if (filters.limit) |limit| {
+                if (out.items.len >= limit) break;
+            }
         }
         return out.toOwnedSlice(allocator);
     }

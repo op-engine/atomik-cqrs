@@ -43,6 +43,10 @@ pub const PQfname = c.PQfname;
 pub const PQgetvalue = c.PQgetvalue;
 pub const PQgetisnull = c.PQgetisnull;
 pub const PQcmdTuples = c.PQcmdTuples;
+pub const PQresultErrorField = c.PQresultErrorField;
 pub const PQescapeString = c.PQescapeString;
 pub const PQescapeBytea = c.PQescapeBytea;
 pub const PQfreemem = c.PQfreemem;
+
+// PostgreSQL diagnostic field code for the 5-character SQLSTATE (e.g. "23505").
+pub const PG_DIAG_SQLSTATE: c_int = 'C';

@@ -18,8 +18,11 @@ pub fn main() !void {
         try allocator.dupe(u8, default_database_url);
     defer allocator.free(database_url);
 
+    const safe_url = try redact_db_url(allocator, database_url);
+    defer allocator.free(safe_url);
+
     std.debug.print("Atomik CQRS Migration Tool\n", .{});
-    std.debug.print("   Database: {s}\n\n", .{database_url});
+    std.debug.print("   Database: {s}\n\n", .{safe_url});
 
     var pool = try postgres_pool.ConnectionPool.init(allocator, database_url, 1);
     defer pool.deinit();
@@ -96,4 +99,19 @@ fn record_migration(
 /// Compare migration filenames (001-* before 002-*, etc.)
 fn compare_migration_names(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
+}
+
+/// Return a copy of `url` with any password component replaced by "***".
+/// Handles postgres://user:password@host/db. Caller owns the returned slice.
+fn redact_db_url(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+    const at = std.mem.indexOf(u8, url, "@") orelse return allocator.dupe(u8, url);
+    const sep = "://";
+    const after_scheme = (std.mem.indexOf(u8, url, sep) orelse return allocator.dupe(u8, url)) + sep.len;
+    const user_pass = url[after_scheme..at];
+    const colon = std.mem.indexOf(u8, user_pass, ":") orelse return allocator.dupe(u8, url);
+    // url[0 .. after_scheme + colon + 1] is "scheme://user:"
+    return std.fmt.allocPrint(allocator, "{s}***{s}", .{
+        url[0 .. after_scheme + colon + 1],
+        url[at..],
+    });
 }

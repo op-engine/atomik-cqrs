@@ -14,6 +14,7 @@ const libpq = @import("libpq_mock.zig");
 pub const PgError = error{
     ConnectionFailed,
     QueryFailed,
+    UniqueViolation,
     TransactionFailed,
     NoRows,
     TooManyRows,
@@ -36,9 +37,14 @@ pub const ResultSet = struct {
 
     pub fn deinit(self: *ResultSet) void {
         for (self.rows.items) |row| {
+            for (row.values) |maybe_val| {
+                if (maybe_val) |val| self.allocator.free(val);
+            }
             self.allocator.free(row.values);
         }
         self.rows.deinit(self.allocator);
+        for (self.columns) |col| self.allocator.free(col);
+        self.allocator.free(self.columns);
     }
 
     pub fn count(self: ResultSet) usize {
@@ -150,8 +156,7 @@ pub const Connection = struct {
         defer libpq.PQclear(result);
 
         if (libpq.PQresultStatus(result) != libpq.PGRES_TUPLES_OK) {
-            const error_msg = libpq.PQresultErrorMessage(result);
-            std.debug.print("PostgreSQL query error: {s}\n", .{error_msg});
+            std.log.err("PostgreSQL query error: {s}", .{std.mem.span(libpq.PQresultErrorMessage(result))});
             return PgError.QueryFailed;
         }
 
@@ -206,22 +211,6 @@ pub const Connection = struct {
         };
     }
 
-    /// Execute a query that returns one row
-    pub fn query_one(
-        self: *Connection,
-        sql: []const u8,
-        args: []const []const u8,
-    ) !Row {
-        var result = try self.query(sql, args);
-        defer result.deinit();
-
-        if (result.first()) |row| {
-            return row;
-        }
-
-        return PgError.NoRows;
-    }
-
     /// Execute a command (INSERT, UPDATE, DELETE)
     pub fn exec(
         self: *Connection,
@@ -264,8 +253,10 @@ pub const Connection = struct {
         defer libpq.PQclear(result);
 
         if (libpq.PQresultStatus(result) != libpq.PGRES_COMMAND_OK) {
-            const error_msg = libpq.PQresultErrorMessage(result);
-            std.debug.print("PostgreSQL exec error: {s}\n", .{error_msg});
+            if (libpq.PQresultErrorField(result, libpq.PG_DIAG_SQLSTATE)) |ss| {
+                if (std.mem.eql(u8, std.mem.span(ss), "23505")) return PgError.UniqueViolation;
+            }
+            std.log.err("PostgreSQL exec error: {s}", .{std.mem.span(libpq.PQresultErrorMessage(result))});
             return PgError.QueryFailed;
         }
 
@@ -330,7 +321,14 @@ pub const ConnectionPool = struct {
         self.allocator.free(self.database_url);
     }
 
-    /// Get a connection from the pool. Thread-safe.
+    /// Get a connection from the pool. Thread-safe for initialization.
+    ///
+    /// NOTE: once the pool is full, all callers share connections[0]. The mutex
+    /// only protects the init path — concurrent callers will use the same
+    /// Connection without synchronization. This is safe only for single-threaded
+    /// use cases (e.g., WASM workers handling one request at a time). Before
+    /// adding multi-threaded callers, replace with a semaphore-guarded queue
+    /// that blocks until a connection is truly idle. See docs/decisions.md ADR-06.
     pub fn get_connection(self: *ConnectionPool) !*Connection {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
