@@ -28,6 +28,7 @@ LIBPQ_FLAG   := $(if $(LIBPQ_PREFIX),-Dlibpq-prefix=$(LIBPQ_PREFIX))
         fmt fmt-check check \
         install db-provision \
         edge-install edge-dev edge-test-unit edge-test-integration edge-poc edge-deploy edge-deploy-prd \
+        seed-adhoc seed-prd \
         clean clean-all \
         ci ci-full \
         release
@@ -149,6 +150,18 @@ edge-deploy-prd: edge-install wasm ## Deploy edge Worker to production, repointi
 	@test -f ../../.env || { echo "No .env at betty root — NEON_DB_KEY not found."; exit 1; }
 	bunx wrangler hyperdrive update $(PRD_HYPERDRIVE_ID) --connection-string="$$(grep NEON_DB_KEY ../../.env | cut -d= -f2-)"
 	bunx wrangler deploy --config edge/wrangler.jsonc --env production
+
+seed-adhoc: ## Apply illustrative seed events (packages/schema-etl) to the adhoc database
+	@test -f .env.local || { echo "Run 'make db-provision' first."; exit 1; }
+	cd ../schema-etl && bun install && bun run seed -- \
+		--database-url="$$(grep ATOMIK_DATABASE_URL ../atomik-cqrs/.env.local | cut -d= -f2-)" \
+		--file=seeds/atomik-cqrs/events.yaml
+
+seed-prd: ## Apply illustrative seed events (packages/schema-etl) to the production database
+	@test -f ../../.env || { echo "No .env at betty root — NEON_DB_KEY not found."; exit 1; }
+	cd ../schema-etl && bun install && bun run seed -- \
+		--database-url="$$(grep NEON_DB_KEY ../../.env | cut -d= -f2- | sed -E 's/(ep-[a-z0-9-]+)-pooler/\1/')" \
+		--file=seeds/atomik-cqrs/events.yaml
 
 # ============================================================================
 # CLEAN
