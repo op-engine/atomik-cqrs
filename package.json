@@ -1,14 +1,15 @@
 {
   "name": "atomik-cqrs-edge",
+  "devDependencies": {
+    "@types/pg": "^8.20.0",
+    "wrangler": "^4.99.0"
+  },
   "private": true,
-  "type": "module",
   "scripts": {
     "dev": "wrangler dev --config edge/wrangler.jsonc"
   },
+  "type": "module",
   "dependencies": {
-    "postgres": "^3.4.5"
-  },
-  "devDependencies": {
-    "wrangler": "^4.99.0"
+    "pg": "^8.22.0"
   }
 }

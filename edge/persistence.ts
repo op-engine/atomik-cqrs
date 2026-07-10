@@ -5,12 +5,19 @@
 // reimplements just enough of the same contract (append with OCC, ordered read) in TypeScript,
 // talking to Postgres directly. See ADR-11 (docs/adr/decisions.md) for the full rationale.
 //
+// Driver: `pg` (node-postgres), not postgres.js — postgres.js reproducibly failed against a real
+// deployed Hyperdrive binding ("Network connection lost" / "write CONNECTION_CLOSED" on the very
+// first query, every time, despite matching every documented config), even though it worked fine
+// under local `wrangler dev` (which bypasses the real Hyperdrive proxy layer entirely). `pg` is
+// Cloudflare's own "RECOMMENDED" driver for Hyperdrive; confirmed working end-to-end against the
+// real production binding where postgres.js was not.
+//
 // UUID encoding: WASM hands back 36-char hyphenated UUID strings (cqrs.uuid_to_string). The
 // native adapter stores UUIDs as 32-char lowercase hex with no hyphens (postgres_pool.uuid_to_hex),
 // matching init.sql's VARCHAR(32) columns. This module strips hyphens before writing so both
 // adapters share the exact same schema and encoding — no DDL changes needed.
 
-import postgres from 'postgres';
+import { Client } from 'pg';
 
 export class OptimisticConcurrencyConflict extends Error {
   constructor() {
@@ -19,10 +26,10 @@ export class OptimisticConcurrencyConflict extends Error {
   }
 }
 
-// Minimal shape of postgres.js's tagged-template client — just enough surface for this module,
-// and small enough to fake in tests without pulling in the real driver (mirrors atomik-cqrs's
-// own libpq mock/real bridge pattern, their ADR-07, on the TS side).
-export type SqlClient = <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]) => Promise<T>;
+// Minimal query surface — just enough to fake in tests without pulling in the real driver
+// (mirrors atomik-cqrs's own libpq mock/real bridge pattern, their ADR-07, on the TS side).
+// Matches pg's Client.query(text, params) shape directly.
+export type SqlClient = (text: string, params: unknown[]) => Promise<{ rows: any[] }>;
 
 export interface DomainEventInput {
   eventId: string;
@@ -58,19 +65,28 @@ function isUniqueViolation(err: unknown): boolean {
 
 export function createStore(client: string | SqlClient) {
   const ownsClient = typeof client === 'string';
-  // max: 5 stays under Workers' hard 6-concurrent-connections-per-invocation limit; prepare:
-  // true is postgres.js's default but stated explicitly since Hyperdrive's query caching
-  // requires prepared statements to work.
-  const sql: SqlClient = ownsClient
-    ? (postgres(client as string, { max: 5, prepare: true }) as unknown as SqlClient)
-    : client;
+  const pgClient = ownsClient ? new Client({ connectionString: client as string }) : null;
+
+  // pg requires an explicit connect() before querying; do it lazily so `createStore` itself
+  // stays synchronous, and only once even if multiple queries fire concurrently.
+  let connecting: Promise<void> | null = null;
+  async function ensureConnected(): Promise<void> {
+    if (!pgClient) return;
+    if (!connecting) connecting = pgClient.connect();
+    await connecting;
+  }
+
+  const query: SqlClient = ownsClient
+    ? async (text, params) => {
+        await ensureConnected();
+        return pgClient!.query(text, params);
+      }
+    : (client as SqlClient);
 
   /** No-op for an injected/fake client (tests own that lifecycle); closes the real connection
    *  otherwise. Call via `ctx.waitUntil(store.end())` so cleanup doesn't block the response. */
   async function end(): Promise<void> {
-    if (ownsClient) {
-      await (sql as unknown as { end: () => Promise<void> }).end();
-    }
+    if (pgClient) await pgClient.end();
   }
 
   async function appendEvent(tenantId: string, event: DomainEventInput): Promise<void> {
@@ -79,17 +95,24 @@ export function createStore(client: string | SqlClient) {
     const aggregateHex = stripHyphens(event.aggregateId);
     const createdByHex = stripHyphens(event.userId);
 
-    // postgres.js auto-JSON.stringifies a parameter that's cast to ::jsonb, so we must hand it a
-    // parsed object here — event.data is already a JSON-encoded string (matches Zig's
-    // DomainEvent.data), and passing it through unparsed would double-encode it (the column ends
-    // up holding a jsonb *string of a string* instead of the object).
-    const parsedData: unknown = JSON.parse(event.data);
-
     try {
-      await sql`
-        INSERT INTO events (id, tenant_id, aggregate_id, aggregate_type, event_type, event_data, version, timestamp, created_by)
-        VALUES (${idHex}, ${tenantHex}, ${aggregateHex}, ${event.aggregateType}, ${event.eventType}, ${parsedData}::jsonb, ${event.version}, ${event.timestamp}, ${createdByHex})
-      `;
+      await query(
+        `INSERT INTO events (id, tenant_id, aggregate_id, aggregate_type, event_type, event_data, version, timestamp, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)`,
+        [
+          idHex,
+          tenantHex,
+          aggregateHex,
+          event.aggregateType,
+          event.eventType,
+          // pg does not auto-stringify (unlike postgres.js) — event.data is already a
+          // JSON-encoded string, so it can be bound directly and cast with ::jsonb.
+          event.data,
+          event.version,
+          event.timestamp,
+          createdByHex,
+        ],
+      );
     } catch (err) {
       if (isUniqueViolation(err)) {
         throw new OptimisticConcurrencyConflict();
@@ -102,16 +125,15 @@ export function createStore(client: string | SqlClient) {
     const tenantHex = stripHyphens(tenantId);
     const aggregateHex = stripHyphens(aggregateId);
 
-    const rows = await sql<{ event_type: string; version: number; data: string }[]>`
-      SELECT event_type, version, event_data::text AS data
-      FROM events
-      WHERE tenant_id = ${tenantHex}
-        AND aggregate_id = ${aggregateHex}
-        AND aggregate_type = ${aggregateType}
-      ORDER BY version ASC
-    `;
+    const result = await query(
+      `SELECT event_type, version, event_data::text AS data
+       FROM events
+       WHERE tenant_id = $1 AND aggregate_id = $2 AND aggregate_type = $3
+       ORDER BY version ASC`,
+      [tenantHex, aggregateHex, aggregateType],
+    );
 
-    return rows.map((row) => ({
+    return result.rows.map((row) => ({
       eventType: row.event_type,
       version: row.version,
       data: row.data,

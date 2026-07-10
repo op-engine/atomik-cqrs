@@ -1,8 +1,8 @@
-// Hermetic unit tests for persistence.ts — no network, no real database. Mocks the
-// postgres.js tagged-template client to prove OCC-conflict translation, UUID hyphen-stripping,
-// and query parameter shape in isolation. Mirrors atomik-cqrs's own libpq mock/real bridge
-// pattern (their ADR-07) applied to the TS side. Live-database behavior is covered separately
-// in persistence.integration.test.ts.
+// Hermetic unit tests for persistence.ts — no network, no real database. Mocks the pg-shaped
+// query client to prove OCC-conflict translation, UUID hyphen-stripping, and query parameter
+// shape in isolation. Mirrors atomik-cqrs's own libpq mock/real bridge pattern (their ADR-07)
+// applied to the TS side. Live-database behavior is covered separately in
+// persistence.integration.test.ts.
 
 import { describe, test, expect } from 'bun:test';
 import { createStore, OptimisticConcurrencyConflict, type SqlClient, type DomainEventInput } from './persistence';
@@ -28,12 +28,12 @@ function baseEvent(overrides: Partial<DomainEventInput> = {}): DomainEventInput 
 }
 
 // Captures every call so assertions can inspect exact parameter values/order without a real DB.
-function mockSql(handler: (values: unknown[]) => unknown) {
-  const calls: unknown[][] = [];
-  const sql = (async (_strings: TemplateStringsArray, ...values: unknown[]) => {
-    calls.push(values);
-    return handler(values);
-  }) as SqlClient;
+function mockSql(handler: (params: unknown[]) => unknown[]) {
+  const calls: { text: string; params: unknown[] }[] = [];
+  const sql: SqlClient = async (text, params) => {
+    calls.push({ text, params });
+    return { rows: handler(params) };
+  };
   return { sql, calls };
 }
 
@@ -46,7 +46,7 @@ describe('appendEvent', () => {
 
     expect(calls).toHaveLength(1);
     const [idHex, tenantHex, aggregateHex, aggregateType, eventType, data, version, timestamp, createdByHex] =
-      calls[0];
+      calls[0].params;
 
     expect(idHex).toBe('0123456789abcdef0123456789abcdef');
     expect(tenantHex).toBe('11111111222233334444555555555555');
@@ -54,9 +54,9 @@ describe('appendEvent', () => {
     expect(createdByHex).toBe('bbbbbbbbccccddddeeeeffffffffffff');
     expect(aggregateType).toBe('DemoWidget');
     expect(eventType).toBe('DemoWidgetCreated');
-    // event.data is a JSON-encoded string in; the client receives the *parsed* object, so
-    // postgres.js's own ::jsonb auto-stringify only encodes it once (see persistence.ts).
-    expect(data).toEqual({ name: 'Widget A' });
+    // Unlike postgres.js, pg does not auto-stringify parameters — event.data (already a
+    // JSON-encoded string) is bound as-is and cast with ::jsonb in the query text.
+    expect(data).toBe('{"name":"Widget A"}');
     expect(version).toBe(1);
     expect(timestamp).toBe(1720000000000);
 
@@ -111,7 +111,7 @@ describe('getEvents', () => {
       { eventType: 'DemoWidgetRenamed', version: 2, data: '{"name":"Widget B"}' },
     ]);
 
-    const [tenantHex, aggregateHex, aggregateType] = calls[0];
+    const [tenantHex, aggregateHex, aggregateType] = calls[0].params;
     expect(tenantHex).toBe('11111111222233334444555555555555');
     expect(aggregateHex).toBe('66666666777788889999aaaaaaaaaaaa');
     expect(aggregateType).toBe('DemoWidget');
