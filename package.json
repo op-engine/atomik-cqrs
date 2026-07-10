@@ -1,0 +1,14 @@
+{
+  "name": "atomik-cqrs-edge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --config edge/wrangler.jsonc"
+  },
+  "dependencies": {
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "wrangler": "^4.99.0"
+  }
+}

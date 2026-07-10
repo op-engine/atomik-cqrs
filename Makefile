@@ -27,6 +27,7 @@ LIBPQ_FLAG   := $(if $(LIBPQ_PREFIX),-Dlibpq-prefix=$(LIBPQ_PREFIX))
         migrate \
         fmt fmt-check check \
         install db-provision \
+        edge-install edge-dev edge-test-unit edge-test-integration edge-poc \
         clean clean-all \
         ci ci-full \
         release
@@ -109,6 +110,29 @@ db-provision: install ## Provision a Neon DB via neon-new and write URL to .env.
 	cd integration && bun run provision.ts
 
 # ============================================================================
+# EDGE / POC (ADR-003 Option D — see docs/adr/decisions.md, ADR-11)
+# ============================================================================
+
+edge-install: ## Install edge/ JS dependencies (bun install, submodule root)
+	bun install
+
+edge-dev: edge-install wasm ## Run the edge Worker locally via wrangler dev
+	@test -f .env.local || { echo "Run 'make db-provision' first."; exit 1; }
+	@grep ATOMIK_DATABASE_URL .env.local > edge/.dev.vars
+	bunx wrangler dev --config edge/wrangler.jsonc
+
+edge-test-unit: edge-install ## Hermetic TS unit tests (mocked Postgres + mocked WASM, no network)
+	bun test edge/persistence.test.ts edge/worker.test.ts
+
+edge-test-integration: edge-install db-provision ## TS persistence tests against a real (ephemeral Neon) Postgres
+	bun test --env-file=.env.local edge/persistence.integration.test.ts
+
+edge-poc: edge-install wasm ## Run the full end-to-end POC (spawns wrangler dev, runs script, reports pass/fail)
+	@test -f .env.local || { echo "Run 'make db-provision' first."; exit 1; }
+	@grep ATOMIK_DATABASE_URL .env.local > edge/.dev.vars
+	bun run edge/poc/run.ts
+
+# ============================================================================
 # CLEAN
 # ============================================================================
 
@@ -116,7 +140,7 @@ clean: ## Remove Zig build artifacts (zig-out, .zig-cache)
 	rm -rf zig-out .zig-cache
 
 clean-all: clean ## Remove all generated artifacts including node_modules
-	rm -rf integration/node_modules
+	rm -rf integration/node_modules node_modules
 
 # ============================================================================
 # CI

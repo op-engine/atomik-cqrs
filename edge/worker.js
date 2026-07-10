@@ -1,4 +1,6 @@
 import wasmBytes from '../zig-out/wasm/atomik-cqrs-edge-harness.wasm';
+import { createStore } from './persistence.ts';
+import { createRoutes } from './routes.ts';
 
 let exports_ = null;
 
@@ -14,7 +16,10 @@ const wasmImports = {
 };
 
 async function initWasm() {
-  const { instance } = await WebAssembly.instantiate(wasmBytes, wasmImports);
+  // Wrangler's `.wasm` import gives an already-compiled WebAssembly.Module (not raw bytes), so
+  // WebAssembly.instantiate resolves directly to the Instance here — not the {module, instance}
+  // shape you'd get by instantiating a BufferSource.
+  const instance = await WebAssembly.instantiate(wasmBytes, wasmImports);
   exports_ = instance.exports;
 }
 
@@ -39,58 +44,81 @@ function freeString(ptr, len) {
 // would exhaust it before they reach WASM memory.
 const MAX_BODY_BYTES = 64 * 1024;
 
+// Low-level WASM FFI call: instantiate on first use, marshal method/path/body across the linear
+// memory boundary, return the already-parsed {status, body} envelope. This is the one piece of
+// real WASM plumbing in the file — routes.ts takes it as an injected dependency so route logic
+// can be unit-tested against a fake instead (see worker.test.ts).
+async function callWasm(method, path, bodyText) {
+  if (!exports_) await initWasm();
+
+  const bodyBytes = bodyText ? encoder.encode(bodyText) : new Uint8Array(0);
+  if (bodyBytes.length > MAX_BODY_BYTES) {
+    return { status: 413, body: { error: 'request body too large' } };
+  }
+
+  const m = writeString(method);
+  const p = writeString(path);
+  const b = bodyBytes.length > 0 ? writeBytes(bodyBytes) : { ptr: 0, len: 0 };
+
+  const responseLen = exports_.handle_request(m.ptr, m.len, p.ptr, p.len, b.ptr, b.len);
+
+  freeString(m.ptr, m.len);
+  freeString(p.ptr, p.len);
+  freeString(b.ptr, b.len);
+
+  const outputPtr = exports_.get_output_ptr();
+  const raw = decoder.decode(new Uint8Array(exports_.memory.buffer, outputPtr, responseLen));
+
+  const envelope = JSON.parse(raw);
+  return { status: envelope.status, body: envelope.body };
+}
+
+// Deliberately NOT cached at module scope like `exports_` above: a postgres.js client holds an
+// open socket, and Cloudflare Workers forbids reusing I/O objects (sockets/streams) created in
+// one request's context from a different request's context ("Cannot perform I/O on behalf of a
+// different request" — confirmed by actually hitting this against a live wrangler dev). A fresh
+// client per request is the correct pattern here regardless — it's also what a real Hyperdrive
+// binding expects: create postgres.js fresh per request pointed at env.HYPERDRIVE.connectionString,
+// and let Hyperdrive itself own the actual connection pooling.
+function getStore(env) {
+  return createStore(env.ATOMIK_DATABASE_URL);
+}
+
+function jsonResponse(result) {
+  return new Response(JSON.stringify(result.body), {
+    status: result.status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
 export default {
-  async fetch(req) {
-    if (!exports_) await initWasm();
-
+  async fetch(req, env) {
+    const routes = createRoutes({ callWasm, store: getStore(env) });
     const url = new URL(req.url);
-    const method = req.method;
-    const path = url.pathname;
 
-    let bodyBytes = new Uint8Array(0);
-    if (method !== 'GET' && method !== 'HEAD') {
-      const raw = await req.arrayBuffer();
-      if (raw.byteLength > MAX_BODY_BYTES) {
-        return new Response(
-          JSON.stringify({ error: 'request body too large' }),
-          { status: 413, headers: { 'Content-Type': 'application/json' } },
-        );
-      }
-      bodyBytes = new Uint8Array(raw);
+    if (req.method === 'GET' && url.pathname === '/health') {
+      return jsonResponse(await routes.health());
     }
 
-    const m = writeString(method);
-    const p = writeString(path);
-    const b = bodyBytes.length > 0 ? writeBytes(bodyBytes) : { ptr: 0, len: 0 };
+    const createMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/commands$/);
+    if (req.method === 'POST' && createMatch) {
+      const body = await req.json();
+      const result = await routes.createWidget({
+        tenantId: body.tenant_id,
+        userId: body.user_id,
+        aggregateId: createMatch[1],
+        name: body.name,
+      });
+      return jsonResponse(result);
+    }
 
-    const responseLen = exports_.handle_request(
-      m.ptr, m.len,
-      p.ptr, p.len,
-      b.ptr, b.len,
-    );
+    const replayMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/state$/);
+    if (req.method === 'GET' && replayMatch) {
+      const tenantId = url.searchParams.get('tenant_id');
+      const result = await routes.replayWidget({ tenantId, aggregateId: replayMatch[1] });
+      return jsonResponse(result);
+    }
 
-    freeString(m.ptr, m.len);
-    freeString(p.ptr, p.len);
-    freeString(b.ptr, b.len);
-
-    const outputPtr = exports_.get_output_ptr();
-    const raw = decoder.decode(
-      new Uint8Array(exports_.memory.buffer, outputPtr, responseLen),
-    );
-
-    let status = 200;
-    let responseBody = raw;
-    try {
-      const envelope = JSON.parse(raw);
-      status = envelope.status ?? 200;
-      responseBody = typeof envelope.body === 'string'
-        ? envelope.body
-        : JSON.stringify(envelope.body);
-    } catch (_) {}
-
-    return new Response(responseBody, {
-      status,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return jsonResponse({ status: 404, body: { error: 'not found' } });
   },
 };

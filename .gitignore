@@ -3,3 +3,8 @@ zig-out/
 .DS_Store
 .env.local
 integration/node_modules/
+integration/.env
+node_modules/
+.dev.vars
+.dev.vars.*
+edge/.wrangler/

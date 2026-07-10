@@ -6,9 +6,10 @@ export async function createDatabase() {
     poolerUrl,
     claimUrl
   } = await instantPostgres({
+    referrer: 'atomik-cqrs',
     seed: {
       type: 'sql-script',
-      path: './init.sql',
+      path: '../init.sql',
     }
   });
 
