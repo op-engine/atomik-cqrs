@@ -243,7 +243,26 @@ describe('replayAggregate', () => {
 
     expect(result).toEqual({
       status: 200,
-      body: { aggregate_id: 'a', version: 2, state: { name: 'Widget B' }, event_count: 2 },
+      body: {
+        aggregate_id: 'a',
+        version: 2,
+        state: { name: 'Widget B' },
+        event_count: 2,
+        events: [
+          { event_type: 'SessionCompleted', version: 1, data: { name: 'Widget A' } },
+          { event_type: 'PrayerApplicationLogged', version: 2, data: { name: 'Widget B' } },
+        ],
+      },
     });
+  });
+
+  test('short-circuits without enriching when WASM rejects the replay', async () => {
+    const { callWasm } = mockCallWasm(() => ({ status: 400, body: { error: 'invalid aggregate_id' } }));
+    const { store } = mockStore({ events: [] });
+    const routes = createRoutes({ callWasm, store });
+
+    const result = await routes.replayAggregate({ tenantId: 't', aggregateId: 'bad', aggregateType: 'Member' });
+
+    expect(result).toEqual({ status: 400, body: { error: 'invalid aggregate_id' } });
   });
 });

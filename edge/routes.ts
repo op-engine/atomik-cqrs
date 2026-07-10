@@ -108,6 +108,10 @@ export function createRoutes(deps: { callWasm: CallWasm; store: Store }) {
    * (Aggregate.load_from_history under the hood). `data` is parsed back into an object here —
    * WASM's /replay now expects a real JSON value per event (std.json.Value), not the
    * JSON-encoded string form Postgres returns it as.
+   *
+   * The response is enriched with the raw event history (already fetched above for WASM) so
+   * callers get both the merged `state` fold and the underlying timeline from one call, without
+   * a second round-trip or any Zig changes.
    */
   async function replayAggregate(input: {
     tenantId: string;
@@ -115,13 +119,22 @@ export function createRoutes(deps: { callWasm: CallWasm; store: Store }) {
     aggregateType: string;
   }): Promise<WasmResponse> {
     const events = await store.getEvents(input.tenantId, input.aggregateId, input.aggregateType);
+    const parsedEvents = events.map((e) => ({ event_type: e.eventType, version: e.version, data: JSON.parse(e.data) }));
 
     const replayBody = JSON.stringify({
       aggregate_id: input.aggregateId,
-      events: events.map((e) => ({ event_type: e.eventType, version: e.version, data: JSON.parse(e.data) })),
+      events: parsedEvents,
     });
 
-    return callWasm('POST', '/replay', replayBody);
+    const wasmResult = await callWasm('POST', '/replay', replayBody);
+    if (wasmResult.status !== 200) {
+      return wasmResult;
+    }
+
+    return {
+      ...wasmResult,
+      body: { ...wasmResult.body, events: parsedEvents },
+    };
   }
 
   return { health, createEvent, replayAggregate };
