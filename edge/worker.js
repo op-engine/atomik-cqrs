@@ -77,11 +77,13 @@ async function callWasm(method, path, bodyText) {
 // open socket, and Cloudflare Workers forbids reusing I/O objects (sockets/streams) created in
 // one request's context from a different request's context ("Cannot perform I/O on behalf of a
 // different request" — confirmed by actually hitting this against a live wrangler dev). A fresh
-// client per request is the correct pattern here regardless — it's also what a real Hyperdrive
-// binding expects: create postgres.js fresh per request pointed at env.HYPERDRIVE.connectionString,
-// and let Hyperdrive itself own the actual connection pooling.
+// client per request, pointed at env.HYPERDRIVE.connectionString, is both the workaround for that
+// constraint and exactly the pattern Hyperdrive itself expects — it owns the actual pooling.
+// `env.HYPERDRIVE.connectionString` also works transparently under local `wrangler dev`, backed
+// by CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE (set by the Makefile from
+// .env.local) — no separate local/prod code path needed here.
 function getStore(env) {
-  return createStore(env.ATOMIK_DATABASE_URL);
+  return createStore(env.HYPERDRIVE.connectionString);
 }
 
 function jsonResponse(result) {
@@ -91,34 +93,41 @@ function jsonResponse(result) {
   });
 }
 
+async function route(req, routes, url) {
+  if (req.method === 'GET' && url.pathname === '/health') {
+    return routes.health();
+  }
+
+  const createMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/commands$/);
+  if (req.method === 'POST' && createMatch) {
+    const body = await req.json();
+    return routes.createWidget({
+      tenantId: body.tenant_id,
+      userId: body.user_id,
+      aggregateId: createMatch[1],
+      name: body.name,
+    });
+  }
+
+  const replayMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/state$/);
+  if (req.method === 'GET' && replayMatch) {
+    const tenantId = url.searchParams.get('tenant_id');
+    return routes.replayWidget({ tenantId, aggregateId: replayMatch[1] });
+  }
+
+  return { status: 404, body: { error: 'not found' } };
+}
+
 export default {
-  async fetch(req, env) {
-    const routes = createRoutes({ callWasm, store: getStore(env) });
-    const url = new URL(req.url);
+  async fetch(req, env, ctx) {
+    const store = getStore(env);
+    const routes = createRoutes({ callWasm, store });
 
-    if (req.method === 'GET' && url.pathname === '/health') {
-      return jsonResponse(await routes.health());
-    }
-
-    const createMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/commands$/);
-    if (req.method === 'POST' && createMatch) {
-      const body = await req.json();
-      const result = await routes.createWidget({
-        tenantId: body.tenant_id,
-        userId: body.user_id,
-        aggregateId: createMatch[1],
-        name: body.name,
-      });
-      return jsonResponse(result);
-    }
-
-    const replayMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/state$/);
-    if (req.method === 'GET' && replayMatch) {
-      const tenantId = url.searchParams.get('tenant_id');
-      const result = await routes.replayWidget({ tenantId, aggregateId: replayMatch[1] });
-      return jsonResponse(result);
-    }
-
-    return jsonResponse({ status: 404, body: { error: 'not found' } });
+    // Resolve the actual response first, THEN schedule cleanup — store.end() must not run
+    // until every query this request issues has actually been submitted, or it can close the
+    // connection before routes.* even gets to use it.
+    const result = await route(req, routes, new URL(req.url));
+    ctx.waitUntil(store.end());
+    return jsonResponse(result);
   },
 };

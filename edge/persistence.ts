@@ -57,7 +57,21 @@ function isUniqueViolation(err: unknown): boolean {
 }
 
 export function createStore(client: string | SqlClient) {
-  const sql: SqlClient = typeof client === 'string' ? (postgres(client) as unknown as SqlClient) : client;
+  const ownsClient = typeof client === 'string';
+  // max: 5 stays under Workers' hard 6-concurrent-connections-per-invocation limit; prepare:
+  // true is postgres.js's default but stated explicitly since Hyperdrive's query caching
+  // requires prepared statements to work.
+  const sql: SqlClient = ownsClient
+    ? (postgres(client as string, { max: 5, prepare: true }) as unknown as SqlClient)
+    : client;
+
+  /** No-op for an injected/fake client (tests own that lifecycle); closes the real connection
+   *  otherwise. Call via `ctx.waitUntil(store.end())` so cleanup doesn't block the response. */
+  async function end(): Promise<void> {
+    if (ownsClient) {
+      await (sql as unknown as { end: () => Promise<void> }).end();
+    }
+  }
 
   async function appendEvent(tenantId: string, event: DomainEventInput): Promise<void> {
     const tenantHex = stripHyphens(tenantId);
@@ -104,5 +118,5 @@ export function createStore(client: string | SqlClient) {
     }));
   }
 
-  return { appendEvent, getEvents };
+  return { appendEvent, getEvents, end };
 }

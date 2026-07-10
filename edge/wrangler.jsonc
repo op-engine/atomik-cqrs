@@ -7,5 +7,24 @@
 
   "observability": {
     "enabled": true
+  },
+
+  // Default env = adhoc. Repointed at a fresh neon-new branch on every `make edge-deploy`
+  // (wrangler hyperdrive update), since adhoc is deliberately throwaway/orchestrated, not a
+  // fixed long-lived database. Local `wrangler dev` ignores `id` and uses
+  // CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE instead (set by the Makefile from
+  // .env.local) -- see Makefile edge-dev/edge-poc targets.
+  "hyperdrive": [
+    { "binding": "HYPERDRIVE", "id": "45302acea9ae496a8fd2361be219d94c" }
+  ],
+
+  "env": {
+    "production": {
+      // Repointed at NEON_DB_KEY on every `make edge-deploy-prd`, same reasoning as adhoc above
+      // (stays in sync automatically if the prod credential ever rotates).
+      "hyperdrive": [
+        { "binding": "HYPERDRIVE", "id": "556c641f4f8443649fd8f99e15f69b7c" }
+      ]
+    }
   }
 }
