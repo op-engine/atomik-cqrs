@@ -101,18 +101,21 @@ async function route(req, routes, url) {
   const createMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/commands$/);
   if (req.method === 'POST' && createMatch) {
     const body = await req.json();
-    return routes.createWidget({
+    return routes.createEvent({
       tenantId: body.tenant_id,
       userId: body.user_id,
       aggregateId: createMatch[1],
-      name: body.name,
+      aggregateType: body.aggregate_type,
+      eventType: body.event_type,
+      data: body.data,
     });
   }
 
   const replayMatch = url.pathname.match(/^\/aggregates\/([^/]+)\/state$/);
   if (req.method === 'GET' && replayMatch) {
     const tenantId = url.searchParams.get('tenant_id');
-    return routes.replayWidget({ tenantId, aggregateId: replayMatch[1] });
+    const aggregateType = url.searchParams.get('aggregate_type');
+    return routes.replayAggregate({ tenantId, aggregateId: replayMatch[1], aggregateType });
   }
 
   return { status: 404, body: { error: 'not found' } };

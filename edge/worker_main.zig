@@ -109,6 +109,12 @@ fn dispatch(
 // POST /commands — pure command -> event construction, no I/O
 // ============================================================================
 //
+// Domain-agnostic on purpose: aggregate_type/event_type/data are all
+// caller-supplied, not hardcoded. No real LMS command handlers exist yet
+// (ADR-002 territory) — until they do, this stays mechanical construction +
+// version-stamping only, so it isn't locked to one placeholder shape
+// (originally "DemoWidget", which blocked anything else from flowing through).
+//
 // TS supplies `aggregate_id` (it owns identity/addressing across calls) and
 // `expected_version` (it owns all persistence, so it's the only side that knows
 // the current version). This is the actual I/O boundary from ADR-11: WASM never
@@ -119,9 +125,11 @@ fn dispatch(
 
 const CommandBody = struct {
     aggregate_id: []const u8,
+    aggregate_type: []const u8,
+    event_type: []const u8,
     expected_version: u32,
     timestamp: i64,
-    name: []const u8,
+    data: std.json.Value,
 };
 
 fn handle_command(allocator: std.mem.Allocator, body: []const u8) !RouteResult {
@@ -134,14 +142,13 @@ fn handle_command(allocator: std.mem.Allocator, body: []const u8) !RouteResult {
         return .{ .status = 400, .body = "{\"error\":\"invalid aggregate_id\"}" };
     };
 
-    const escaped_name = try atomik.json.escape_json_string(allocator, cmd.name);
-    const event_data = try std.fmt.allocPrint(allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
+    const event_data = try std.json.Stringify.valueAlloc(allocator, cmd.data, .{});
 
     const event = atomik.cqrs.DomainEvent{
         .event_id = atomik.cqrs.generate_uuid(),
         .aggregate_id = aggregate_id,
-        .aggregate_type = "DemoWidget",
-        .event_type = "DemoWidgetCreated",
+        .aggregate_type = cmd.aggregate_type,
+        .event_type = cmd.event_type,
         .tenant_id = std.mem.zeroes(atomik.cqrs.UUID),
         .version = cmd.expected_version + 1,
         .timestamp = cmd.timestamp,
@@ -158,15 +165,19 @@ fn handle_command(allocator: std.mem.Allocator, body: []const u8) !RouteResult {
 // ============================================================================
 //
 // TS has already fetched the aggregate's committed events (persistence.getEvents)
-// and hands them here as-is; WASM never queries storage itself. `data` on each
-// input event is a JSON-encoded string (matches DomainEvent.data), not a nested
-// object, so it round-trips through std.json.parseFromSlice without needing
-// dynamic std.json.Value handling.
+// and hands them here as-is; WASM never queries storage itself.
+//
+// Replay is a generic shallow JSON merge, not domain-specific extraction: each
+// event's `data` object is merged key-by-key into an accumulated `state`
+// object (later events win on key collisions). This is the only replay
+// strategy that makes sense without real per-event-type apply logic (ADR-002
+// territory) — it works for any aggregate/event type the caller sends, not
+// just one hardcoded shape.
 
 const ReplayEventInput = struct {
     event_type: []const u8,
     version: u32,
-    data: []const u8,
+    data: std.json.Value,
 };
 
 const ReplayRequestBody = struct {
@@ -174,25 +185,26 @@ const ReplayRequestBody = struct {
     events: []ReplayEventInput,
 };
 
-/// Minimal aggregate for the POC: replays DemoWidgetCreated events, tracking the
-/// widget's current name and how many events were applied. Mirrors the
-/// base/apply_event embedding pattern used in src/cqrs.zig's own tests
-/// (WidgetAggregate).
-const DemoWidget = struct {
+/// Generic aggregate: folds every event's `data` object into `state` via
+/// shallow merge, and tracks event_count. No knowledge of any specific
+/// event_type. Mirrors the base/apply_event embedding pattern used in
+/// src/cqrs.zig's own tests (WidgetAggregate), but domain-agnostic.
+const GenericAggregate = struct {
     base: atomik.cqrs.Aggregate,
-    name: []const u8 = "",
+    state: std.json.ObjectMap,
     event_count: usize = 0,
 
-    const NameData = struct { name: []const u8 };
-
     fn apply(base: *atomik.cqrs.Aggregate, event: atomik.cqrs.DomainEvent) anyerror!void {
-        const self: *DemoWidget = @fieldParentPtr("base", base);
-        if (std.mem.eql(u8, event.event_type, "DemoWidgetCreated")) {
-            // Not calling parsed.deinit(): this runs inside a single request's
-            // FixedBufferAllocator arena (see handle_request), reclaimed in one
-            // shot via fba.reset() once the response is written.
-            const parsed = std.json.parseFromSlice(NameData, self.base.allocator, event.data, .{}) catch return;
-            self.name = parsed.value.name;
+        const self: *GenericAggregate = @fieldParentPtr("base", base);
+        // Not calling parsed.deinit(): this runs inside a single request's
+        // FixedBufferAllocator arena (see handle_request), reclaimed in one
+        // shot via fba.reset() once the response is written.
+        const parsed = std.json.parseFromSlice(std.json.Value, self.base.allocator, event.data, .{}) catch return;
+        if (parsed.value == .object) {
+            var it = parsed.value.object.iterator();
+            while (it.next()) |entry| {
+                try self.state.put(self.base.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
         }
         self.event_count += 1;
     }
@@ -207,30 +219,34 @@ fn handle_replay(allocator: std.mem.Allocator, body: []const u8) !RouteResult {
         return .{ .status = 400, .body = "{\"error\":\"invalid aggregate_id\"}" };
     };
 
-    var widget = DemoWidget{ .base = atomik.cqrs.Aggregate.init(allocator, aggregate_id) };
+    var aggregate = GenericAggregate{
+        .base = atomik.cqrs.Aggregate.init(allocator, aggregate_id),
+        .state = try std.json.ObjectMap.init(allocator, &.{}, &.{}),
+    };
 
     const events = try allocator.alloc(atomik.cqrs.DomainEvent, parsed.value.events.len);
     for (parsed.value.events, 0..) |input, i| {
+        const data_json = try std.json.Stringify.valueAlloc(allocator, input.data, .{});
         events[i] = .{
             .event_id = std.mem.zeroes(atomik.cqrs.UUID),
             .aggregate_id = aggregate_id,
-            .aggregate_type = "DemoWidget",
+            .aggregate_type = "",
             .event_type = input.event_type,
             .tenant_id = std.mem.zeroes(atomik.cqrs.UUID),
             .version = input.version,
             .timestamp = 0,
             .user_id = std.mem.zeroes(atomik.cqrs.UUID),
-            .data = input.data,
+            .data = data_json,
         };
     }
 
-    try widget.base.load_from_history(events, DemoWidget.apply);
+    try aggregate.base.load_from_history(events, GenericAggregate.apply);
 
-    const escaped_name = try atomik.json.escape_json_string(allocator, widget.name);
+    const state_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = aggregate.state }, .{});
     const response = try std.fmt.allocPrint(
         allocator,
-        "{{\"aggregate_id\":\"{s}\",\"version\":{d},\"name\":\"{s}\",\"event_count\":{d}}}",
-        .{ parsed.value.aggregate_id, widget.base.version, escaped_name, widget.event_count },
+        "{{\"aggregate_id\":\"{s}\",\"version\":{d},\"state\":{s},\"event_count\":{d}}}",
+        .{ parsed.value.aggregate_id, aggregate.base.version, state_json, aggregate.event_count },
     );
     return .{ .status = 200, .body = response };
 }

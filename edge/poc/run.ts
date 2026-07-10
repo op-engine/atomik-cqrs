@@ -31,17 +31,27 @@ async function waitForHealth(timeoutMs: number): Promise<void> {
   throw new Error(`wrangler dev did not become healthy within ${timeoutMs}ms`);
 }
 
+// DemoWidget/DemoWidgetCreated is just this POC's own placeholder for exercising the mechanism —
+// aggregate_type/event_type are caller-supplied now, not hardcoded in the Worker (see routes.ts).
 async function createCommand(aggregateId: string, tenantId: string, userId: string, name: string) {
   const res = await fetch(`${BASE_URL}/aggregates/${aggregateId}/commands`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tenant_id: tenantId, user_id: userId, name }),
+    body: JSON.stringify({
+      tenant_id: tenantId,
+      user_id: userId,
+      aggregate_type: 'DemoWidget',
+      event_type: 'DemoWidgetCreated',
+      data: { name },
+    }),
   });
   return { status: res.status, body: await res.json() };
 }
 
 async function replay(aggregateId: string, tenantId: string) {
-  const res = await fetch(`${BASE_URL}/aggregates/${aggregateId}/state?tenant_id=${tenantId}`);
+  const res = await fetch(
+    `${BASE_URL}/aggregates/${aggregateId}/state?tenant_id=${tenantId}&aggregate_type=DemoWidget`,
+  );
   return { status: res.status, body: await res.json() };
 }
 
@@ -82,13 +92,16 @@ async function runAssertions(): Promise<void> {
 
   // 3. Replay must reflect only the two committed events (v1 + whichever v2 attempt won) —
   // never three, regardless of which concurrent attempt succeeded.
-  const state = await replay(aggregateId, tenantId);
-  assert(state.status === 200, `expected 200 from replay, got ${state.status}: ${JSON.stringify(state.body)}`);
-  const body = state.body as { version: number; event_count: number; name: string };
+  const replayed = await replay(aggregateId, tenantId);
+  assert(replayed.status === 200, `expected 200 from replay, got ${replayed.status}: ${JSON.stringify(replayed.body)}`);
+  const body = replayed.body as { version: number; event_count: number; state: { name?: string } };
   assert(body.version === 2, `expected replayed version 2, got ${body.version}`);
   assert(body.event_count === 2, `expected exactly 2 events replayed, got ${body.event_count}`);
-  assert(body.name === 'Widget v2a' || body.name === 'Widget v2b', `unexpected replayed name: ${body.name}`);
-  console.log(`[3/3] replay reflects exactly the 2 committed events (name="${body.name}") — pass`);
+  assert(
+    body.state.name === 'Widget v2a' || body.state.name === 'Widget v2b',
+    `unexpected replayed state: ${JSON.stringify(body.state)}`,
+  );
+  console.log(`[3/3] replay reflects exactly the 2 committed events (state.name="${body.state.name}") — pass`);
 }
 
 async function main() {

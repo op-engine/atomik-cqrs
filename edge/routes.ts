@@ -2,6 +2,10 @@
 // Postgres client so it can be unit-tested in isolation (see worker.test.ts) — mirrors ADR-11's
 // split: WASM owns domain logic, this module (running in JS) owns orchestrating I/O around it.
 // worker.js is the thin Cloudflare Workers entrypoint that wires the real callWasm/store in.
+//
+// Domain-agnostic on purpose: aggregate_type/event_type/data all come from the caller, not
+// hardcoded here. No real LMS command handlers exist yet (ADR-002 territory) — until they do,
+// this stays generic plumbing rather than locked to one placeholder shape.
 
 import { OptimisticConcurrencyConflict, type DomainEventInput, type StoredEvent } from './persistence';
 
@@ -27,8 +31,6 @@ interface CommandEventJson {
   data: unknown;
 }
 
-const AGGREGATE_TYPE = 'DemoWidget';
-
 export function createRoutes(deps: { callWasm: CallWasm; store: Store }) {
   const { callWasm, store } = deps;
 
@@ -42,20 +44,24 @@ export function createRoutes(deps: { callWasm: CallWasm; store: Store }) {
    * event at that version, then persist it — where the database's unique index is the real
    * arbiter under concurrent writes, not anything computed here.
    */
-  async function createWidget(input: {
+  async function createEvent(input: {
     tenantId: string;
     userId: string;
     aggregateId: string;
-    name: string;
+    aggregateType: string;
+    eventType: string;
+    data: unknown;
   }): Promise<WasmResponse> {
-    const existing = await store.getEvents(input.tenantId, input.aggregateId, AGGREGATE_TYPE);
+    const existing = await store.getEvents(input.tenantId, input.aggregateId, input.aggregateType);
     const expectedVersion = existing.length > 0 ? existing[existing.length - 1].version : 0;
 
     const commandBody = JSON.stringify({
       aggregate_id: input.aggregateId,
+      aggregate_type: input.aggregateType,
+      event_type: input.eventType,
       expected_version: expectedVersion,
       timestamp: Date.now(),
-      name: input.name,
+      data: input.data,
     });
 
     const wasmResult = await callWasm('POST', '/commands', commandBody);
@@ -87,24 +93,36 @@ export function createRoutes(deps: { callWasm: CallWasm; store: Store }) {
 
     return {
       status: 200,
-      body: { event_id: eventJson.event_id, aggregate_id: eventJson.aggregate_id, version: eventJson.version },
+      body: {
+        event_id: eventJson.event_id,
+        aggregate_id: eventJson.aggregate_id,
+        aggregate_type: eventJson.aggregate_type,
+        event_type: eventJson.event_type,
+        version: eventJson.version,
+      },
     };
   }
 
-  /** Replay flow: fetch committed events, hand them to WASM's Aggregate.load_from_history. */
-  async function replayWidget(input: { tenantId: string; aggregateId: string }): Promise<WasmResponse> {
-    const events = await store.getEvents(input.tenantId, input.aggregateId, AGGREGATE_TYPE);
+  /**
+   * Replay flow: fetch committed events, hand them to WASM's generic merge-fold
+   * (Aggregate.load_from_history under the hood). `data` is parsed back into an object here —
+   * WASM's /replay now expects a real JSON value per event (std.json.Value), not the
+   * JSON-encoded string form Postgres returns it as.
+   */
+  async function replayAggregate(input: {
+    tenantId: string;
+    aggregateId: string;
+    aggregateType: string;
+  }): Promise<WasmResponse> {
+    const events = await store.getEvents(input.tenantId, input.aggregateId, input.aggregateType);
 
     const replayBody = JSON.stringify({
       aggregate_id: input.aggregateId,
-      // event.data is already a JSON-encoded string (matches Zig's DomainEvent.data) — pass it
-      // through as-is, do NOT JSON.parse it here, or it'd be embedded as a nested object instead
-      // of the string worker_main.zig's std.json.parseFromSlice(ReplayEventInput, ...) expects.
-      events: events.map((e) => ({ event_type: e.eventType, version: e.version, data: e.data })),
+      events: events.map((e) => ({ event_type: e.eventType, version: e.version, data: JSON.parse(e.data) })),
     });
 
     return callWasm('POST', '/replay', replayBody);
   }
 
-  return { health, createWidget, replayWidget };
+  return { health, createEvent, replayAggregate };
 }
