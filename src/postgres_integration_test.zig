@@ -38,7 +38,16 @@ fn open_pool() !postgres_pool.ConnectionPool {
 }
 
 fn make_adapter(pool: *postgres_pool.ConnectionPool) event_store.EventStoreAdapter {
-    var impl = pg.PostgresAdapter.init(std.testing.allocator, pool);
+    // PostgresAdapter.to_adapter() stores &self as EventStoreAdapter.context, so the adapter
+    // must outlive this function - a local/stack `impl` here returns a dangling context pointer
+    // the moment make_adapter returns. This was always latent (undefined behavior reading
+    // reclaimed stack memory) but silently tolerated because release_connection used to be a
+    // total no-op; it surfaced once release_connection actually started dereferencing `self`.
+    // Deliberately leaked via page_allocator (not std.testing.allocator, which would flag it as
+    // a leak): a tiny, one-shot, process-lifetime allocation, simpler than threading a free
+    // through all 18 call sites in a short-lived test binary.
+    const impl = std.heap.page_allocator.create(pg.PostgresAdapter) catch @panic("OOM");
+    impl.* = pg.PostgresAdapter.init(std.testing.allocator, pool);
     return impl.to_adapter();
 }
 

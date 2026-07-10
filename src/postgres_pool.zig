@@ -315,14 +315,40 @@ pub const Connection = struct {
     }
 };
 
-/// Connection pool for PostgreSQL
+/// Connection pool for PostgreSQL.
+///
+/// Formerly a spinlock guarding only lazy-initialization, with every caller
+/// beyond `max_connections` silently sharing `connections[0]` unsynchronized
+/// (see ADR-06 in docs/adr/decisions.md) — safe only for a single caller at a
+/// time. libpq forbids concurrent use of one `PGconn` from multiple threads;
+/// two callers racing on the shared slot corrupts the wire protocol and can
+/// hang indefinitely, which is exactly what surfaced once real concurrent
+/// integration tests started exercising this path.
+///
+/// Now a real bounded pool: `get_connection` blocks (does not spin) until a
+/// connection is genuinely idle, via a semaphore with one permit per slot;
+/// `release_connection` marks the slot idle and signals the semaphore. No two
+/// callers are ever handed the same live `Connection`.
 pub const ConnectionPool = struct {
     allocator: Allocator,
     database_url: []u8,
     max_connections: u32,
     connections: []Connection,
-    active_count: u32 = 0,
-    mutex: std.atomic.Mutex = .unlocked,
+    /// Parallel to `connections`; true for the first `initialized_count` slots
+    /// currently checked out.
+    in_use: []bool,
+    /// How many of `connections` have been lazily created so far (0..max_connections).
+    initialized_count: u32 = 0,
+    /// Protects `connections`/`in_use`/`initialized_count`. Held only for the
+    /// brief scan-and-checkout, never across an actual query.
+    bookkeeping: std.Io.Mutex = .init,
+    /// One permit per slot (idle-and-initialized or not-yet-initialized).
+    /// get_connection blocks here instead of spinning when the pool is full.
+    available: std.Io.Semaphore,
+    /// Owned Io instance so the public API stays synchronous for callers
+    /// (get_connection/release_connection take no Io parameter), matching
+    /// migrate.zig's approach to the same std.Io threading requirement.
+    io_threaded: std.Io.Threaded,
 
     pub fn init(
         allocator: Allocator,
@@ -330,53 +356,71 @@ pub const ConnectionPool = struct {
         max_connections: u32,
     ) !ConnectionPool {
         const connections = try allocator.alloc(Connection, max_connections);
+        errdefer allocator.free(connections);
+
+        const in_use = try allocator.alloc(bool, max_connections);
+        errdefer allocator.free(in_use);
+        @memset(in_use, false);
 
         return ConnectionPool{
             .allocator = allocator,
             .database_url = try allocator.dupe(u8, database_url), // owned []u8 so deinit can zero it
             .max_connections = max_connections,
             .connections = connections,
+            .in_use = in_use,
+            .available = .{ .permits = max_connections },
+            .io_threaded = .init(allocator, .{}),
         };
     }
 
     pub fn deinit(self: *ConnectionPool) void {
-        for (self.connections[0..self.active_count]) |*conn| {
+        for (self.connections[0..self.initialized_count]) |*conn| {
             conn.deinit();
         }
         self.allocator.free(self.connections);
+        self.allocator.free(self.in_use);
         // Zero the DSN before freeing; it may contain a password.
         @memset(self.database_url, 0);
         self.allocator.free(self.database_url);
+        self.io_threaded.deinit();
     }
 
-    /// Get a connection from the pool. Thread-safe for initialization.
-    ///
-    /// NOTE: once the pool is full, all callers share connections[0]. The mutex
-    /// only protects the init path; concurrent callers will use the same
-    /// Connection without synchronization. This is safe only for single-threaded
-    /// use cases (e.g., WASM workers handling one request at a time). Before
-    /// adding multi-threaded callers, replace with a semaphore-guarded queue
-    /// that blocks until a connection is truly idle. See docs/decisions.md ADR-06.
+    /// Get a connection from the pool, blocking until one is genuinely idle.
+    /// Thread-safe: no two callers are ever handed the same live Connection.
     pub fn get_connection(self: *ConnectionPool) !*Connection {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
+        const io = self.io_threaded.io();
 
-        if (self.active_count < self.max_connections) {
-            const idx = self.active_count;
-            self.connections[idx] = try Connection.init(self.allocator, self.database_url);
-            self.active_count += 1;
-            return &self.connections[idx];
+        try self.available.wait(io);
+        errdefer self.available.post(io); // give the permit back if checkout fails below
+
+        self.bookkeeping.lockUncancelable(io);
+        defer self.bookkeeping.unlock(io);
+
+        for (0..self.initialized_count) |i| {
+            if (!self.in_use[i]) {
+                self.in_use[i] = true;
+                return &self.connections[i];
+            }
         }
 
-        if (self.active_count > 0) {
-            return &self.connections[0];
-        }
-
-        return PgError.ConnectionFailed;
+        const idx = self.initialized_count;
+        self.connections[idx] = try Connection.init(self.allocator, self.database_url);
+        self.in_use[idx] = true;
+        self.initialized_count += 1;
+        return &self.connections[idx];
     }
 
     /// Release connection back to pool. Thread-safe.
-    pub fn release_connection(_: *ConnectionPool, _: *Connection) void {}
+    pub fn release_connection(self: *ConnectionPool, conn: *Connection) void {
+        const io = self.io_threaded.io();
+        const idx = (@intFromPtr(conn) - @intFromPtr(self.connections.ptr)) / @sizeOf(Connection);
+
+        self.bookkeeping.lockUncancelable(io);
+        self.in_use[idx] = false;
+        self.bookkeeping.unlock(io);
+
+        self.available.post(io);
+    }
 };
 
 /// Parse a PostgreSQL connection URL
