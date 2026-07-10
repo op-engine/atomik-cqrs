@@ -106,7 +106,18 @@ pub const PostgresAdapter = struct {
             \\);
         ;
 
-        _ = try conn.exec(sql, &[_][]const u8{});
+        // PQexecParams (which conn.exec always uses, per ADR-03's parameterized-query-only
+        // policy) rejects multi-statement strings outright ("cannot insert multiple commands
+        // into a prepared statement") — unlike PQexec's simple query protocol, it can only ever
+        // run one statement per call. Split and exec individually, matching the same technique
+        // migrate.zig's apply_migration already uses for the same reason.
+        var it = std.mem.splitScalar(u8, sql, ';');
+        while (it.next()) |stmt| {
+            const trimmed = std.mem.trim(u8, stmt, " \t\n\r");
+            if (trimmed.len > 0) {
+                _ = try conn.exec(trimmed, &[_][]const u8{});
+            }
+        }
     }
 
     // ========================================================================
