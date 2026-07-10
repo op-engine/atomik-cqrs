@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "dev/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "dev/**"]
 
 jobs:
   test:
@@ -47,6 +47,15 @@ jobs:
       - name: Build migration tool
         run: zig build migrate
 
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install edge/ JS dependencies
+        run: bun install
+
+      - name: Run hermetic TS unit tests (edge/persistence.ts, edge/routes.ts)
+        run: bun test edge/persistence.test.ts edge/worker.test.ts
+
   integration:
     name: Integration tests (Postgres 17)
     runs-on: ubuntu-latest
@@ -87,7 +96,19 @@ jobs:
           restore-keys: zig-integration-
 
       - name: Install libpq
-        run: sudo apt-get install -y libpq-dev
+        run: sudo apt-get install -y libpq-dev postgresql-client
 
       - name: Run integration tests
         run: zig build test-integration --summary all
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install edge/ JS dependencies
+        run: bun install
+
+      - name: Apply schema for TS persistence integration tests
+        run: psql "$ATOMIK_DATABASE_URL" -f init.sql
+
+      - name: Run TS persistence integration tests (edge/persistence.ts against live Postgres)
+        run: bun test edge/persistence.integration.test.ts
