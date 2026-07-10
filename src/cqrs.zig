@@ -189,7 +189,7 @@ fn fill_os_entropy(buf: []u8) void {
     const os = @import("builtin").os.tag;
     if (comptime os == .linux) {
         const rc = std.os.linux.getrandom(buf.ptr, buf.len, 0);
-        std.debug.assert(std.os.linux.getErrno(rc) == .SUCCESS);
+        std.debug.assert(std.posix.errno(rc) == .SUCCESS);
     } else {
         // macOS, iOS, BSDs: arc4random_buf is always available and never fails.
         std.c.arc4random_buf(buf.ptr, buf.len);
