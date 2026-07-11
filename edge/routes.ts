@@ -7,7 +7,7 @@
 // hardcoded here. No real LMS command handlers exist yet (ADR-002 territory) — until they do,
 // this stays generic plumbing rather than locked to one placeholder shape.
 
-import { OptimisticConcurrencyConflict, type DomainEventInput, type StoredEvent } from './persistence';
+import { OptimisticConcurrencyConflict, type AuditEvent, type DomainEventInput, type StoredEvent } from './persistence';
 
 export interface WasmResponse {
   status: number;
@@ -19,6 +19,7 @@ export type CallWasm = (method: string, path: string, body: string) => Promise<W
 export interface Store {
   appendEvent(tenantId: string, event: DomainEventInput): Promise<void>;
   getEvents(tenantId: string, aggregateId: string, aggregateType: string): Promise<StoredEvent[]>;
+  listEvents(tenantId: string, limit: number): Promise<AuditEvent[]>;
 }
 
 interface CommandEventJson {
@@ -137,5 +138,33 @@ export function createRoutes(deps: { callWasm: CallWasm; store: Store }) {
     };
   }
 
-  return { health, createEvent, replayAggregate };
+  const AUDIT_LOG_LIMIT = 200;
+
+  /**
+   * Tenant-wide event log for the Audit Log view — no WASM involved, a straight read. Response
+   * keys are snake_case, matching replayAggregate's WASM-originated convention (the AuditEvent
+   * TS type itself is camelCase; this maps it at the boundary rather than changing the type).
+   * `data` is parsed back into an object here for the same reason replayAggregate does it: callers
+   * get a real JSON value, not the JSON-encoded string form Postgres returns it as.
+   */
+  async function listEvents(input: { tenantId: string }): Promise<WasmResponse> {
+    const events = await store.listEvents(input.tenantId, AUDIT_LOG_LIMIT);
+    return {
+      status: 200,
+      body: {
+        events: events.map((e) => ({
+          id: e.id,
+          aggregate_id: e.aggregateId,
+          aggregate_type: e.aggregateType,
+          event_type: e.eventType,
+          data: JSON.parse(e.data),
+          version: e.version,
+          timestamp: e.timestamp,
+          created_by: e.createdBy,
+        })),
+      },
+    };
+  }
+
+  return { health, createEvent, replayAggregate, listEvents };
 }

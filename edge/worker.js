@@ -118,6 +118,11 @@ async function route(req, routes, url) {
     return routes.replayAggregate({ tenantId, aggregateId: replayMatch[1], aggregateType });
   }
 
+  if (req.method === 'GET' && url.pathname === '/events') {
+    const tenantId = url.searchParams.get('tenant_id');
+    return routes.listEvents({ tenantId });
+  }
+
   return { status: 404, body: { error: 'not found' } };
 }
 

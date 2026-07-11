@@ -51,6 +51,18 @@ export interface StoredEvent {
   data: string;
 }
 
+export interface AuditEvent {
+  id: string;
+  aggregateId: string;
+  aggregateType: string;
+  eventType: string;
+  /** JSON-encoded string, left unparsed — callers that render it can parse on demand. */
+  data: string;
+  version: number;
+  timestamp: number;
+  createdBy: string;
+}
+
 function stripHyphens(uuid: string): string {
   const hex = uuid.replace(/-/g, '');
   if (hex.length !== 32) {
@@ -140,5 +152,30 @@ export function createStore(client: string | SqlClient) {
     }));
   }
 
-  return { appendEvent, getEvents, end };
+  /** Tenant-wide event listing for the Audit Log — unlike getEvents, not scoped to one aggregate. */
+  async function listEvents(tenantId: string, limit: number): Promise<AuditEvent[]> {
+    const tenantHex = stripHyphens(tenantId);
+
+    const result = await query(
+      `SELECT id, aggregate_id, aggregate_type, event_type, event_data::text AS data, version, timestamp, created_by
+       FROM events
+       WHERE tenant_id = $1
+       ORDER BY timestamp DESC
+       LIMIT $2`,
+      [tenantHex, limit],
+    );
+
+    return result.rows.map((row) => ({
+      id: row.id,
+      aggregateId: row.aggregate_id,
+      aggregateType: row.aggregate_type,
+      eventType: row.event_type,
+      data: row.data,
+      version: row.version,
+      timestamp: row.timestamp,
+      createdBy: row.created_by,
+    }));
+  }
+
+  return { appendEvent, getEvents, listEvents, end };
 }

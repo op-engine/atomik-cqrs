@@ -7,7 +7,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { createRoutes, type CallWasm, type Store, type WasmResponse } from './routes';
-import { OptimisticConcurrencyConflict, type DomainEventInput, type StoredEvent } from './persistence';
+import { OptimisticConcurrencyConflict, type AuditEvent, type DomainEventInput, type StoredEvent } from './persistence';
 
 function mockCallWasm(handler: (method: string, path: string, body: string) => WasmResponse) {
   const calls: { method: string; path: string; body: string }[] = [];
@@ -18,8 +18,13 @@ function mockCallWasm(handler: (method: string, path: string, body: string) => W
   return { callWasm, calls };
 }
 
-function mockStore(opts: { events?: StoredEvent[]; appendEvent?: (tenantId: string, event: DomainEventInput) => Promise<void> } = {}) {
+function mockStore(opts: {
+  events?: StoredEvent[];
+  auditEvents?: AuditEvent[];
+  appendEvent?: (tenantId: string, event: DomainEventInput) => Promise<void>;
+} = {}) {
   const appendCalls: { tenantId: string; event: DomainEventInput }[] = [];
+  const listEventsCalls: { tenantId: string; limit: number }[] = [];
   const store: Store = {
     async getEvents() {
       return opts.events ?? [];
@@ -28,8 +33,12 @@ function mockStore(opts: { events?: StoredEvent[]; appendEvent?: (tenantId: stri
       appendCalls.push({ tenantId, event });
       if (opts.appendEvent) await opts.appendEvent(tenantId, event);
     },
+    async listEvents(tenantId, limit) {
+      listEventsCalls.push({ tenantId, limit });
+      return opts.auditEvents ?? [];
+    },
   };
-  return { store, appendCalls };
+  return { store, appendCalls, listEventsCalls };
 }
 
 describe('health', () => {
@@ -264,5 +273,36 @@ describe('replayAggregate', () => {
     const result = await routes.replayAggregate({ tenantId: 't', aggregateId: 'bad', aggregateType: 'Member' });
 
     expect(result).toEqual({ status: 400, body: { error: 'invalid aggregate_id' } });
+  });
+});
+
+describe('listEvents', () => {
+  test('returns the tenant-wide event list with data parsed back into an object, capped at the audit log limit', async () => {
+    const { callWasm } = mockCallWasm(() => ({ status: 200, body: {} }));
+    const auditEvents: AuditEvent[] = [
+      {
+        id: 'e2', aggregateId: 'a', aggregateType: 'Member', eventType: 'PrayerApplicationLogged',
+        data: '{"note":"b"}', version: 2, timestamp: 2, createdBy: 'u',
+      },
+      {
+        id: 'e1', aggregateId: 'a', aggregateType: 'Member', eventType: 'SessionCompleted',
+        data: '{"note":"a"}', version: 1, timestamp: 1, createdBy: 'u',
+      },
+    ];
+    const { store, listEventsCalls } = mockStore({ auditEvents });
+    const routes = createRoutes({ callWasm, store });
+
+    const result = await routes.listEvents({ tenantId: 't' });
+
+    expect(listEventsCalls).toEqual([{ tenantId: 't', limit: 200 }]);
+    expect(result).toEqual({
+      status: 200,
+      body: {
+        events: [
+          { id: 'e2', aggregate_id: 'a', aggregate_type: 'Member', event_type: 'PrayerApplicationLogged', data: { note: 'b' }, version: 2, timestamp: 2, created_by: 'u' },
+          { id: 'e1', aggregate_id: 'a', aggregate_type: 'Member', event_type: 'SessionCompleted', data: { note: 'a' }, version: 1, timestamp: 1, created_by: 'u' },
+        ],
+      },
+    });
   });
 });
