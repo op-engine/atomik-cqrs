@@ -150,7 +150,13 @@ pub const ProjectionRunner = struct {
         filters.after_seq = from;
 
         const events = try self.store.query(projection.tenant_id, filters);
-        defer self.allocator.free(events);
+        // self.store.free_events, not a plain allocator.free: field ownership
+        // (aggregate_type/event_type/data) is adapter-specific, not part of the
+        // EventStoreAdapter contract - the Postgres adapter heap-allocates those
+        // fields per event, while InMemoryStore's query/get_events return
+        // shallow copies with borrowed (unowned) fields. Each adapter's own
+        // free_events_fn knows which is correct for itself.
+        defer self.store.free_events(events);
 
         if (events.len == 0) return RunResult{ .events_processed = 0, .last_position = from };
 

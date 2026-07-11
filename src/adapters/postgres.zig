@@ -35,6 +35,7 @@ pub const PostgresAdapter = struct {
             .append_events_fn = &append_events_impl,
             .get_events_fn = &get_events_impl,
             .query_fn = &query_impl,
+            .free_events_fn = &free_events_impl,
             .find_by_idempotency_key_fn = &find_by_idempotency_key_impl,
             .store_idempotency_fn = &store_idempotency_impl,
             .deinit_fn = &deinit_impl,
@@ -304,6 +305,14 @@ pub const PostgresAdapter = struct {
             try out.append(allocator, try row_to_event(allocator, row));
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    /// row_to_event heap-allocates aggregate_type/event_type/data per event
+    /// (via allocator.dupe), unlike InMemoryStore's borrowed-reference shallow
+    /// copies - free all three fields on every event, then the slice.
+    fn free_events_impl(ctx: *anyopaque, allocator: Allocator, events: []const cqrs.DomainEvent) void {
+        _ = ctx;
+        cqrs.DomainEvent.free_slice(allocator, events);
     }
 
     // ========================================================================

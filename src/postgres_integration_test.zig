@@ -52,12 +52,7 @@ fn make_adapter(pool: *postgres_pool.ConnectionPool) event_store.EventStoreAdapt
 }
 
 fn free_events(events: []cqrs.DomainEvent) void {
-    for (events) |e| {
-        std.testing.allocator.free(e.aggregate_type);
-        std.testing.allocator.free(e.event_type);
-        std.testing.allocator.free(e.data);
-    }
-    std.testing.allocator.free(events);
+    cqrs.DomainEvent.free_slice(std.testing.allocator, events);
 }
 
 fn make_event(tenant_id: cqrs.UUID, aggregate_id: cqrs.UUID, event_type: []const u8, version: u32) cqrs.DomainEvent {

@@ -46,6 +46,26 @@ pub const DomainEvent = struct {
     /// Used as the projection cursor. 0 when not backed by a sequenced store
     /// (in-memory stores assign 1-based values; WASM resets on restart).
     global_seq: u64 = 0,
+
+    /// Frees this event's three owned string fields (aggregate_type, event_type,
+    /// data) - NOT event_id/aggregate_id/tenant_id/user_id (fixed-size UUID
+    /// arrays, never heap-allocated) or version/timestamp/global_seq (plain
+    /// values). Does not free the DomainEvent itself; see `free_slice` for a
+    /// caller holding `[]DomainEvent`.
+    pub fn free_owned(self: DomainEvent, allocator: Allocator) void {
+        allocator.free(self.aggregate_type);
+        allocator.free(self.event_type);
+        allocator.free(self.data);
+    }
+
+    /// Frees each event's owned string fields, then the slice itself. For a
+    /// caller holding events fetched via EventStoreAdapter.get_events/query
+    /// (adapters allocate aggregate_type/event_type/data per event with the
+    /// caller's allocator - see adapters/postgres.zig's row_to_event).
+    pub fn free_slice(allocator: Allocator, events: []const DomainEvent) void {
+        for (events) |event| event.free_owned(allocator);
+        allocator.free(events);
+    }
 };
 
 /// Audit event envelope. `event_type` is application-defined (e.g. "DATA_EXPORTED").

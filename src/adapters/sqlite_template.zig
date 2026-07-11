@@ -32,6 +32,7 @@ pub const SQLiteAdapter = struct {
             .append_events_fn = &append_events_impl,
             .get_events_fn = &get_events_impl,
             .query_fn = &query_impl,
+            .free_events_fn = &free_events_impl,
             .find_by_idempotency_key_fn = &find_by_idempotency_key_impl,
             .store_idempotency_fn = &store_idempotency_impl,
             .deinit_fn = &deinit_impl,
@@ -128,6 +129,15 @@ pub const SQLiteAdapter = struct {
         // TODO: SELECT * FROM events WHERE tenant_id = ? [AND aggregate_type = ?]
         //       [AND event_type = ?] [AND timestamp BETWEEN ? AND ?] [LIMIT ?]
         return allocator.alloc(cqrs.DomainEvent, 0);
+    }
+
+    fn free_events_impl(ctx: *anyopaque, allocator: Allocator, events: []const cqrs.DomainEvent) void {
+        _ = ctx;
+        // TODO: once get_events_impl/query_impl allocate real per-event string
+        // fields (aggregate_type/event_type/data) from a row, free those here
+        // too via cqrs.DomainEvent.free_slice instead of a plain slice free -
+        // see adapters/postgres.zig's free_events_impl for the pattern.
+        allocator.free(events);
     }
 
     fn find_by_idempotency_key_impl(
