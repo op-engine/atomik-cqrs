@@ -134,3 +134,22 @@ agg.load_from_history_with_snapshot(snap, events, apply_snap, apply_event)
 Filename convention: `NNN-description.sql` (e.g., `001-initial-schema.sql`, `002-add-snapshots.sql`). Lexicographic order on the numeric prefix guarantees consistent application order across environments.
 
 **Consequences:** The migration tool runs against `ATOMIK_DATABASE_URL`. Statement-level atomicity (not file-level) means a partially-applied file is possible if a statement fails mid-file; re-running will attempt the whole file again. For production use, each migration file should be a single atomic DDL statement or wrapped in an explicit `BEGIN`/`COMMIT`.
+
+---
+
+## ADR-11: TypeScript/Hyperdrive persistence adapter for Cloudflare Workers, bypassing native EventStoreAdapter
+
+**Status:** Accepted (fork-specific — mnhpub/atomik-cqrs)
+
+**Context:** The consuming application (Betty; see `docs/decisions/ADR-003-atomik-cqrs-event-sourcing-backend.md` in that repo) deploys the edge WASM harness (`edge/`, see ADR-08) as an actual production event-store, not just a demo. But `EventStoreAdapter`'s only real backend, `postgres_pool.zig`, requires libpq (ADR-07), which needs native OS sockets — `wasm32-freestanding` has none, and Cloudflare's `connect()` socket API (what Hyperdrive-backed drivers use) is only reachable from JavaScript, not from code running inside the WASM sandbox. `edge/worker_main.zig`'s own comment already says as much: "no real DB connection is possible from a demo running purely in the Worker's WASM sandbox."
+
+**Decision:** For this deployment, persistence is handled entirely on the JavaScript side of the FFI boundary — the same `worker.js` shim already used for `fill_random_bytes` (ADR-04) — via a Hyperdrive-pooled Postgres connection (`postgres.js`). The WASM module is used only for what doesn't require I/O: command validation, event application (`Aggregate.load_from_history`), UUID generation. `EventStoreAdapter`'s libpq-based Postgres adapter is not used in this deployment at all.
+
+**Consequences:**
+- The event schema (`migrations/*.sql`) stays shared with upstream — only the code path that reads/writes it diverges.
+- ADR-05's OCC guarantee (`UNIQUE(tenant_id, aggregate_id, version)`, PG error `23505` → conflict) must be reimplemented in TypeScript, catching the unique-violation and translating it to mirror `postgres_pool.zig`'s behavior exactly, so retry semantics don't diverge from the native adapter's contract.
+- ADR-03's parameterized-query requirement carries over in spirit: the TS layer must use `postgres.js`'s parameterized query form, never string-built SQL, for the same SQL-injection reasons.
+- ADR-09's `SnapshotStore` is not reused; if snapshotting is needed here, it must be reimplemented in TS against the same `snapshots` table shape, or deferred until replay cost becomes a real problem.
+- This decision is fork-specific and does not apply to native (non-Workers) deployments, which should keep using the existing libpq-backed `EventStoreAdapter` as-is.
+
+**Upstream note:** If a general-purpose WASM-to-Postgres bridge is ever built (a socket-proxy shim letting Zig code drive `ConnectionPool` from inside `wasm32-freestanding` itself), it should go upstream as a PR against `opengineorg/atomik-cqrs` rather than stay fork-only — it would remove the need for this split entirely. Track divergence against upstream so this ADR doesn't silently rot once that lands.

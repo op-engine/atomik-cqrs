@@ -38,17 +38,83 @@ fn open_pool() !postgres_pool.ConnectionPool {
 }
 
 fn make_adapter(pool: *postgres_pool.ConnectionPool) event_store.EventStoreAdapter {
-    var impl = pg.PostgresAdapter.init(std.testing.allocator, pool);
+    // PostgresAdapter.to_adapter() stores &self as EventStoreAdapter.context, so the adapter
+    // must outlive this function - a local/stack `impl` here returns a dangling context pointer
+    // the moment make_adapter returns. This was always latent (undefined behavior reading
+    // reclaimed stack memory) but silently tolerated because release_connection used to be a
+    // total no-op; it surfaced once release_connection actually started dereferencing `self`.
+    // Deliberately leaked via page_allocator (not std.testing.allocator, which would flag it as
+    // a leak): a tiny, one-shot, process-lifetime allocation, simpler than threading a free
+    // through all 18 call sites in a short-lived test binary.
+    const impl = std.heap.page_allocator.create(pg.PostgresAdapter) catch @panic("OOM");
+    impl.* = pg.PostgresAdapter.init(std.testing.allocator, pool);
     return impl.to_adapter();
 }
 
 fn free_events(events: []cqrs.DomainEvent) void {
-    for (events) |e| {
-        std.testing.allocator.free(e.aggregate_type);
-        std.testing.allocator.free(e.event_type);
-        std.testing.allocator.free(e.data);
+    cqrs.DomainEvent.free_slice(std.testing.allocator, events);
+}
+
+fn jsonValueEql(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .bool => |av| b == .bool and av == b.bool,
+        .integer => |av| switch (b) {
+            .integer => |bv| av == bv,
+            .float => |bv| @as(f64, @floatFromInt(av)) == bv,
+            else => false,
+        },
+        .float => |av| switch (b) {
+            .float => |bv| av == bv,
+            .integer => |bv| av == @as(f64, @floatFromInt(bv)),
+            else => false,
+        },
+        .number_string => |av| switch (b) {
+            .number_string => |bv| std.mem.eql(u8, av, bv),
+            else => false,
+        },
+        .string => |av| switch (b) {
+            .string => |bv| std.mem.eql(u8, av, bv),
+            else => false,
+        },
+        .array => |av| switch (b) {
+            .array => |bv| blk: {
+                if (av.items.len != bv.items.len) break :blk false;
+                for (av.items, bv.items) |ai, bi| {
+                    if (!jsonValueEql(ai, bi)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+        .object => |av| switch (b) {
+            .object => |bv| blk: {
+                if (av.count() != bv.count()) break :blk false;
+                var it = av.iterator();
+                while (it.next()) |entry| {
+                    const bval = bv.get(entry.key_ptr.*) orelse break :blk false;
+                    if (!jsonValueEql(entry.value_ptr.*, bval)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+    };
+}
+
+// Postgres's JSONB columns canonically re-serialize on write (e.g. adding a
+// space after ':'), so byte-for-byte string comparison of round-tripped JSON
+// is the wrong check. Compare parsed structure instead.
+fn expectJsonEqualStrings(expected: []const u8, actual: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var parsed_expected = try std.json.parseFromSlice(std.json.Value, alloc, expected, .{});
+    defer parsed_expected.deinit();
+    var parsed_actual = try std.json.parseFromSlice(std.json.Value, alloc, actual, .{});
+    defer parsed_actual.deinit();
+    if (!jsonValueEql(parsed_expected.value, parsed_actual.value)) {
+        std.debug.print("JSON mismatch:\n  expected: {s}\n  actual:   {s}\n", .{ expected, actual });
+        return error.TestExpectedEqual;
     }
-    std.testing.allocator.free(events);
 }
 
 fn make_event(tenant_id: cqrs.UUID, aggregate_id: cqrs.UUID, event_type: []const u8, version: u32) cqrs.DomainEvent {
@@ -325,7 +391,7 @@ test "idempotency store and retrieve round-trip" {
         }
     }
     try std.testing.expectEqualStrings("CreateOrder", found.?.command_type);
-    try std.testing.expectEqualStrings("{\"order_id\":\"abc\"}", found.?.result);
+    try expectJsonEqualStrings("{\"order_id\":\"abc\"}", found.?.result);
 }
 
 test "idempotency first write wins on duplicate key" {
@@ -358,7 +424,7 @@ test "idempotency first write wins on duplicate key" {
             std.testing.allocator.free(r.result);
         }
     }
-    try std.testing.expectEqualStrings("{\"order_id\":\"first\"}", found.?.result);
+    try expectJsonEqualStrings("{\"order_id\":\"first\"}", found.?.result);
 }
 
 // ============================================================================
@@ -503,7 +569,7 @@ test "EventRepository.store_idempotency first-write-wins on duplicate key" {
             std.testing.allocator.free(r.result);
         }
     }
-    try std.testing.expectEqualStrings("{\"id\":\"first\"}", found.?.result);
+    try expectJsonEqualStrings("{\"id\":\"first\"}", found.?.result);
 }
 
 // ============================================================================
@@ -544,7 +610,7 @@ test "PostgresSnapshotStore save and load round-trip" {
         }
     }
     try std.testing.expectEqual(@as(u32, 7), found.?.version);
-    try std.testing.expectEqualStrings("{\"total\":99}", found.?.state);
+    try expectJsonEqualStrings("{\"total\":99}", found.?.state);
 }
 
 test "get_events after_version skips events already captured in snapshot" {

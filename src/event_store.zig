@@ -26,6 +26,15 @@ pub const EventStoreAdapter = struct {
     /// Pass a snapshot's version to skip already-replayed events.
     get_events_fn: *const fn (ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, aggregate_id: cqrs.UUID, aggregate_type: []const u8, after_version: u32) anyerror![]cqrs.DomainEvent,
     query_fn: *const fn (ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, filters: cqrs.QueryFilters) anyerror![]cqrs.DomainEvent,
+    /// Frees events returned by get_events/query. Ownership of DomainEvent's
+    /// string fields (aggregate_type/event_type/data) is adapter-specific, not
+    /// part of this interface's contract - e.g. the Postgres adapter
+    /// heap-allocates them per event (must free all three fields, then the
+    /// slice), while InMemoryStore's query/get_events return shallow copies of
+    /// already-stored events (fields are borrowed, only the outer slice is
+    /// this call's own allocation). Callers must go through this rather than
+    /// freeing the slice themselves - see projection.zig's ProjectionRunner.run.
+    free_events_fn: *const fn (ctx: *anyopaque, allocator: Allocator, events: []const cqrs.DomainEvent) void,
     find_by_idempotency_key_fn: *const fn (ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, key: []const u8) anyerror!?cqrs.IdempotencyResult,
     store_idempotency_fn: *const fn (ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, key: []const u8, result: cqrs.IdempotencyResult) anyerror!void,
     deinit_fn: *const fn (ctx: *anyopaque) void,
@@ -48,6 +57,12 @@ pub const EventStoreAdapter = struct {
 
     pub fn query(self: *EventStoreAdapter, tenant_id: cqrs.UUID, filters: cqrs.QueryFilters) ![]cqrs.DomainEvent {
         return self.query_fn(self.context, self.allocator, tenant_id, filters);
+    }
+
+    /// Frees events returned by get_events/query, per this adapter's own
+    /// ownership rules. See free_events_fn's doc comment.
+    pub fn free_events(self: *EventStoreAdapter, events: []const cqrs.DomainEvent) void {
+        self.free_events_fn(self.context, self.allocator, events);
     }
 
     pub fn find_by_idempotency_key(self: *EventStoreAdapter, tenant_id: cqrs.UUID, key: []const u8) !?cqrs.IdempotencyResult {
@@ -94,6 +109,7 @@ pub const InMemoryStore = struct {
             .append_events_fn = append_events_impl,
             .get_events_fn = get_events_impl,
             .query_fn = query_impl,
+            .free_events_fn = free_events_impl,
             .find_by_idempotency_key_fn = find_by_idempotency_key_impl,
             .store_idempotency_fn = store_idempotency_impl,
             .deinit_fn = deinit_impl,
@@ -102,6 +118,15 @@ pub const InMemoryStore = struct {
 
     fn create_schema_impl(ctx: *anyopaque) anyerror!void {
         _ = ctx;
+    }
+
+    /// get_events_impl/query_impl return shallow copies of internally-stored
+    /// events - only the returned slice is this call's own allocation, the
+    /// string fields are borrowed references to whatever the caller originally
+    /// passed to append_events. Free only the slice.
+    fn free_events_impl(ctx: *anyopaque, allocator: Allocator, events: []const cqrs.DomainEvent) void {
+        _ = ctx;
+        allocator.free(events);
     }
 
     fn append_events_impl(ctx: *anyopaque, allocator: Allocator, tenant_id: cqrs.UUID, events: []const cqrs.DomainEvent) anyerror!void {

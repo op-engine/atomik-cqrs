@@ -27,6 +27,8 @@ LIBPQ_FLAG   := $(if $(LIBPQ_PREFIX),-Dlibpq-prefix=$(LIBPQ_PREFIX))
         migrate \
         fmt fmt-check check \
         install db-provision \
+        edge-install edge-dev edge-test-unit edge-test-integration edge-poc edge-deploy edge-deploy-prd \
+        seed-adhoc seed-prd \
         clean clean-all \
         ci ci-full \
         release
@@ -109,6 +111,59 @@ db-provision: install ## Provision a Neon DB via neon-new and write URL to .env.
 	cd integration && bun run provision.ts
 
 # ============================================================================
+# EDGE / POC (ADR-003 Option D — see docs/adr/decisions.md, ADR-11)
+# ============================================================================
+#
+# Two Hyperdrive configs, mirrored in edge/wrangler.jsonc's default env (adhoc) and
+# env.production (prd). Both get repointed at deploy time rather than treated as fixed:
+# adhoc is deliberately throwaway (a fresh neon-new branch every deploy), prd tracks
+# NEON_DB_KEY (betty root .env) so a credential rotation there doesn't require a manual step
+# here. Local `wrangler dev`/the POC script ignore both IDs entirely and use
+# CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE instead.
+ADHOC_HYPERDRIVE_ID := 45302acea9ae496a8fd2361be219d94c
+PRD_HYPERDRIVE_ID := 556c641f4f8443649fd8f99e15f69b7c
+
+edge-install: ## Install edge/ JS dependencies (bun install, submodule root)
+	bun install
+
+edge-dev: edge-install wasm ## Run the edge Worker locally via wrangler dev
+	@test -f .env.local || { echo "Run 'make db-provision' first."; exit 1; }
+	CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$$(grep ATOMIK_DATABASE_URL .env.local | cut -d= -f2-)" \
+		bunx wrangler dev --config edge/wrangler.jsonc
+
+edge-test-unit: edge-install ## Hermetic TS unit tests (mocked Postgres + mocked WASM, no network)
+	bun test edge/persistence.test.ts edge/worker.test.ts
+
+edge-test-integration: edge-install db-provision ## TS persistence tests against a real (ephemeral Neon) Postgres
+	bun test --env-file=.env.local edge/persistence.integration.test.ts
+
+edge-poc: edge-install wasm ## Run the full end-to-end POC (spawns wrangler dev, runs script, reports pass/fail)
+	@test -f .env.local || { echo "Run 'make db-provision' first."; exit 1; }
+	CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$$(grep ATOMIK_DATABASE_URL .env.local | cut -d= -f2-)" \
+		bun run edge/poc/run.ts
+
+edge-deploy: edge-install wasm db-provision ## Deploy edge Worker to adhoc, repointing Hyperdrive at a fresh neon-new branch
+	bunx wrangler hyperdrive update $(ADHOC_HYPERDRIVE_ID) --connection-string="$$(grep ATOMIK_DATABASE_URL .env.local | cut -d= -f2-)"
+	bunx wrangler deploy --config edge/wrangler.jsonc
+
+edge-deploy-prd: edge-install wasm ## Deploy edge Worker to production, repointing Hyperdrive at NEON_DB_KEY
+	@test -f ../../.env || { echo "No .env at betty root — NEON_DB_KEY not found."; exit 1; }
+	bunx wrangler hyperdrive update $(PRD_HYPERDRIVE_ID) --connection-string="$$(grep NEON_DB_KEY ../../.env | cut -d= -f2-)"
+	bunx wrangler deploy --config edge/wrangler.jsonc --env production
+
+seed-adhoc: ## Apply illustrative seed events (packages/schema-etl) to the adhoc database
+	@test -f .env.local || { echo "Run 'make db-provision' first."; exit 1; }
+	cd ../schema-etl && bun install && bun run seed -- \
+		--database-url="$$(grep ATOMIK_DATABASE_URL ../atomik-cqrs/.env.local | cut -d= -f2-)" \
+		--file=seeds/atomik-cqrs/events.yaml
+
+seed-prd: ## Apply illustrative seed events (packages/schema-etl) to the production database
+	@test -f ../../.env || { echo "No .env at betty root — NEON_DB_KEY not found."; exit 1; }
+	cd ../schema-etl && bun install && bun run seed -- \
+		--database-url="$$(grep NEON_DB_KEY ../../.env | cut -d= -f2- | sed -E 's/(ep-[a-z0-9-]+)-pooler/\1/')" \
+		--file=seeds/atomik-cqrs/events.yaml
+
+# ============================================================================
 # CLEAN
 # ============================================================================
 
@@ -116,7 +171,7 @@ clean: ## Remove Zig build artifacts (zig-out, .zig-cache)
 	rm -rf zig-out .zig-cache
 
 clean-all: clean ## Remove all generated artifacts including node_modules
-	rm -rf integration/node_modules
+	rm -rf integration/node_modules node_modules
 
 # ============================================================================
 # CI
