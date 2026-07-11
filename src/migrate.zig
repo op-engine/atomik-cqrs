@@ -12,6 +12,12 @@ const default_database_url = "postgres://localhost/atomik_dev";
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
+    // Zig 0.16 moved filesystem operations under std.Io.Dir, threaded through an explicit
+    // Io instance rather than the old std.fs.cwd() global.
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     const database_url = if (std.c.getenv("ATOMIK_DATABASE_URL")) |env_value|
         try allocator.dupe(u8, std.mem.span(env_value))
     else
@@ -37,26 +43,26 @@ pub fn main() !void {
     try ensure_migrations_table(conn);
 
     // Collect all *.sql files in ./migrations in sorted filename order.
-    var dir = std.fs.cwd().openDir("migrations", .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(io, "migrations", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("No migrations/ directory found — nothing to do.\n", .{});
             return;
         },
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    var filenames = std.ArrayList([]const u8).init(allocator);
+    var filenames: std.ArrayList([]const u8) = .empty;
     defer {
         for (filenames.items) |name| allocator.free(name);
-        filenames.deinit();
+        filenames.deinit(allocator);
     }
 
     var dir_iter = dir.iterate();
-    while (try dir_iter.next()) |entry| {
+    while (try dir_iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
-        try filenames.append(try allocator.dupe(u8, entry.name));
+        try filenames.append(allocator, try allocator.dupe(u8, entry.name));
     }
 
     if (filenames.items.len == 0) {
@@ -78,7 +84,7 @@ pub fn main() !void {
 
         std.debug.print("  apply {s} ...", .{filename});
 
-        const sql_content = try dir.readFileAlloc(allocator, filename, 4 * 1024 * 1024);
+        const sql_content = try dir.readFileAlloc(io, filename, allocator, .limited(4 * 1024 * 1024));
         defer allocator.free(sql_content);
 
         try apply_migration(conn, sql_content);

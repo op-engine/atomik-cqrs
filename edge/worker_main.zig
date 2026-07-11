@@ -1,9 +1,10 @@
-//! WASM entry point for Cloudflare Workers (wasm32-freestanding). This is a
-//! test harness that proves the library builds and runs at the edge - it
-//! is not shipped application code. Exercises the router + cqrs + event
-//! store modules end to end using an in-memory adapter (no real DB
-//! connection is possible from a demo running purely in the Worker's
-//! WASM sandbox).
+//! WASM entry point for Cloudflare Workers (wasm32-freestanding).
+//!
+//! Persistence is handled entirely on the JavaScript side (edge/persistence.ts, via Hyperdrive)
+//! — this module owns domain logic only: validating a command into a DomainEvent, and replaying
+//! a history of events into aggregate state. It never touches EventStoreAdapter or any storage
+//! backend, because wasm32-freestanding cannot make the native OS socket calls atomik-cqrs's
+//! libpq-based adapter needs. See docs/adr/decisions.md, ADR-11, for the full rationale.
 
 const std = @import("std");
 const atomik = @import("atomik-cqrs");
@@ -93,125 +94,159 @@ fn dispatch(
         return .{ .status = 200, .body = "{\"status\":\"healthy\",\"runtime\":\"zig-wasm\"}" };
     }
 
-    if (std.mem.eql(u8, path, "/events") and std.mem.eql(u8, method, "POST")) {
-        return append_demo_event(allocator, body);
+    if (std.mem.eql(u8, path, "/commands") and std.mem.eql(u8, method, "POST")) {
+        return handle_command(allocator, body);
+    }
+
+    if (std.mem.eql(u8, path, "/replay") and std.mem.eql(u8, method, "POST")) {
+        return handle_replay(allocator, body);
     }
 
     return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
 }
 
-/// Round-trips a single event through the ported cqrs/event_store/json
-/// modules: build a DomainEvent, append it to an in-memory adapter, read
-/// it back, and serialize the result. Proves the core library works
-/// end-to-end inside the WASM sandbox.
-fn append_demo_event(allocator: std.mem.Allocator, body: []const u8) !RouteResult {
-    var store = InMemoryDemoStore.init(allocator);
-    var adapter = store.to_adapter();
-    defer adapter.deinit();
+// ============================================================================
+// POST /commands — pure command -> event construction, no I/O
+// ============================================================================
+//
+// Domain-agnostic on purpose: aggregate_type/event_type/data are all
+// caller-supplied, not hardcoded. No real LMS command handlers exist yet
+// (ADR-002 territory) — until they do, this stays mechanical construction +
+// version-stamping only, so it isn't locked to one placeholder shape
+// (originally "DemoWidget", which blocked anything else from flowing through).
+//
+// TS supplies `aggregate_id` (it owns identity/addressing across calls) and
+// `expected_version` (it owns all persistence, so it's the only side that knows
+// the current version). This is the actual I/O boundary from ADR-11: WASM never
+// reads or writes storage, it only builds and validates the next event.
+// tenant_id/user_id are zeroed here — they're not part of serialize_event's
+// output, and TS already has the real values from the original request, so it
+// reattaches them itself before calling persistence.appendEvent.
 
-    const tenant_id = atomik.cqrs.generate_uuid();
-    const aggregate_id = atomik.cqrs.generate_uuid();
-    const event_data = if (body.len > 0) body else "{}";
+const CommandBody = struct {
+    aggregate_id: []const u8,
+    aggregate_type: []const u8,
+    event_type: []const u8,
+    expected_version: u32,
+    timestamp: i64,
+    data: std.json.Value,
+};
+
+fn handle_command(allocator: std.mem.Allocator, body: []const u8) !RouteResult {
+    const parsed = std.json.parseFromSlice(CommandBody, allocator, body, .{}) catch {
+        return .{ .status = 400, .body = "{\"error\":\"invalid command body\"}" };
+    };
+    const cmd = parsed.value;
+
+    const aggregate_id = atomik.cqrs.string_to_uuid(cmd.aggregate_id) catch {
+        return .{ .status = 400, .body = "{\"error\":\"invalid aggregate_id\"}" };
+    };
+
+    const event_data = try std.json.Stringify.valueAlloc(allocator, cmd.data, .{});
 
     const event = atomik.cqrs.DomainEvent{
         .event_id = atomik.cqrs.generate_uuid(),
         .aggregate_id = aggregate_id,
-        .aggregate_type = "DemoWidget",
-        .event_type = "DemoWidgetCreated",
-        .tenant_id = tenant_id,
-        .version = 1,
-        .timestamp = 0,
-        .user_id = atomik.cqrs.generate_uuid(),
+        .aggregate_type = cmd.aggregate_type,
+        .event_type = cmd.event_type,
+        .tenant_id = std.mem.zeroes(atomik.cqrs.UUID),
+        .version = cmd.expected_version + 1,
+        .timestamp = cmd.timestamp,
+        .user_id = std.mem.zeroes(atomik.cqrs.UUID),
         .data = event_data,
     };
 
-    try adapter.append_events(tenant_id, &[_]atomik.cqrs.DomainEvent{event});
-
-    const events = try adapter.get_events(tenant_id, aggregate_id, "DemoWidget");
-    if (events.len == 0) return .{ .status = 500, .body = "{\"error\":\"event not found after append\"}" };
-
-    const serialized = try atomik.json.serialize_event(allocator, events[0]);
+    const serialized = try atomik.json.serialize_event(allocator, event);
     return .{ .status = 200, .body = serialized };
 }
 
-/// Minimal in-memory EventStoreAdapter scoped to a single request.
-///
-/// Intentional simplifications; do NOT copy these into a real adapter:
-///   • get_events_impl ignores tenant_id and aggregate_type. Safe here because
-///     the store is created fresh per request and reset after the response is
-///     written, so it never holds data from more than one tenant. A real adapter
-///     MUST filter on all three dimensions (tenant_id, aggregate_id, aggregate_type).
-///   • No OCC enforcement; version uniqueness is not checked on append.
-///   • No idempotency storage; find/store are no-ops.
-const InMemoryDemoStore = struct {
-    allocator: std.mem.Allocator,
-    events: std.ArrayList(atomik.cqrs.DomainEvent),
+// ============================================================================
+// POST /replay — drives cqrs.Aggregate.load_from_history for real
+// ============================================================================
+//
+// TS has already fetched the aggregate's committed events (persistence.getEvents)
+// and hands them here as-is; WASM never queries storage itself.
+//
+// Replay is a generic shallow JSON merge, not domain-specific extraction: each
+// event's `data` object is merged key-by-key into an accumulated `state`
+// object (later events win on key collisions). This is the only replay
+// strategy that makes sense without real per-event-type apply logic (ADR-002
+// territory) — it works for any aggregate/event type the caller sends, not
+// just one hardcoded shape.
 
-    fn init(allocator: std.mem.Allocator) InMemoryDemoStore {
-        return .{ .allocator = allocator, .events = .empty };
+const ReplayEventInput = struct {
+    event_type: []const u8,
+    version: u32,
+    data: std.json.Value,
+};
+
+const ReplayRequestBody = struct {
+    aggregate_id: []const u8,
+    events: []ReplayEventInput,
+};
+
+/// Generic aggregate: folds every event's `data` object into `state` via
+/// shallow merge, and tracks event_count. No knowledge of any specific
+/// event_type. Mirrors the base/apply_event embedding pattern used in
+/// src/cqrs.zig's own tests (WidgetAggregate), but domain-agnostic.
+const GenericAggregate = struct {
+    base: atomik.cqrs.Aggregate,
+    state: std.json.ObjectMap,
+    event_count: usize = 0,
+
+    fn apply(base: *atomik.cqrs.Aggregate, event: atomik.cqrs.DomainEvent) anyerror!void {
+        const self: *GenericAggregate = @fieldParentPtr("base", base);
+        // Not calling parsed.deinit(): this runs inside a single request's
+        // FixedBufferAllocator arena (see handle_request), reclaimed in one
+        // shot via fba.reset() once the response is written.
+        const parsed = std.json.parseFromSlice(std.json.Value, self.base.allocator, event.data, .{}) catch return;
+        if (parsed.value == .object) {
+            var it = parsed.value.object.iterator();
+            while (it.next()) |entry| {
+                try self.state.put(self.base.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+        self.event_count += 1;
     }
+};
 
-    fn to_adapter(self: *InMemoryDemoStore) atomik.event_store.EventStoreAdapter {
-        return .{
-            .allocator = self.allocator,
-            .context = self,
-            .create_schema_fn = create_schema_impl,
-            .append_events_fn = append_events_impl,
-            .get_events_fn = get_events_impl,
-            .query_fn = query_impl,
-            .find_by_idempotency_key_fn = find_by_idempotency_key_impl,
-            .store_idempotency_fn = store_idempotency_impl,
-            .deinit_fn = deinit_impl,
+fn handle_replay(allocator: std.mem.Allocator, body: []const u8) !RouteResult {
+    const parsed = std.json.parseFromSlice(ReplayRequestBody, allocator, body, .{}) catch {
+        return .{ .status = 400, .body = "{\"error\":\"invalid replay body\"}" };
+    };
+
+    const aggregate_id = atomik.cqrs.string_to_uuid(parsed.value.aggregate_id) catch {
+        return .{ .status = 400, .body = "{\"error\":\"invalid aggregate_id\"}" };
+    };
+
+    var aggregate = GenericAggregate{
+        .base = atomik.cqrs.Aggregate.init(allocator, aggregate_id),
+        .state = try std.json.ObjectMap.init(allocator, &.{}, &.{}),
+    };
+
+    const events = try allocator.alloc(atomik.cqrs.DomainEvent, parsed.value.events.len);
+    for (parsed.value.events, 0..) |input, i| {
+        const data_json = try std.json.Stringify.valueAlloc(allocator, input.data, .{});
+        events[i] = .{
+            .event_id = std.mem.zeroes(atomik.cqrs.UUID),
+            .aggregate_id = aggregate_id,
+            .aggregate_type = "",
+            .event_type = input.event_type,
+            .tenant_id = std.mem.zeroes(atomik.cqrs.UUID),
+            .version = input.version,
+            .timestamp = 0,
+            .user_id = std.mem.zeroes(atomik.cqrs.UUID),
+            .data = data_json,
         };
     }
 
-    fn create_schema_impl(ctx: *anyopaque) anyerror!void {
-        _ = ctx;
-    }
+    try aggregate.base.load_from_history(events, GenericAggregate.apply);
 
-    fn append_events_impl(ctx: *anyopaque, allocator: std.mem.Allocator, tenant_id: atomik.cqrs.UUID, events: []const atomik.cqrs.DomainEvent) anyerror!void {
-        _ = allocator;
-        _ = tenant_id;
-        const self: *InMemoryDemoStore = @ptrCast(@alignCast(ctx));
-        for (events) |event| try self.events.append(self.allocator, event);
-    }
-
-    fn get_events_impl(ctx: *anyopaque, allocator: std.mem.Allocator, tenant_id: atomik.cqrs.UUID, aggregate_id: atomik.cqrs.UUID, aggregate_type: []const u8) anyerror![]atomik.cqrs.DomainEvent {
-        _ = tenant_id;
-        _ = aggregate_type;
-        const self: *InMemoryDemoStore = @ptrCast(@alignCast(ctx));
-        var out: std.ArrayList(atomik.cqrs.DomainEvent) = .empty;
-        for (self.events.items) |event| {
-            if (std.mem.eql(u8, &event.aggregate_id, &aggregate_id)) try out.append(allocator, event);
-        }
-        return out.toOwnedSlice(allocator);
-    }
-
-    fn query_impl(ctx: *anyopaque, allocator: std.mem.Allocator, tenant_id: atomik.cqrs.UUID, filters: atomik.cqrs.QueryFilters) anyerror![]atomik.cqrs.DomainEvent {
-        _ = ctx;
-        _ = tenant_id;
-        _ = filters;
-        return allocator.alloc(atomik.cqrs.DomainEvent, 0);
-    }
-
-    fn find_by_idempotency_key_impl(ctx: *anyopaque, allocator: std.mem.Allocator, tenant_id: atomik.cqrs.UUID, key: []const u8) anyerror!?atomik.cqrs.IdempotencyResult {
-        _ = ctx;
-        _ = allocator;
-        _ = tenant_id;
-        _ = key;
-        return null;
-    }
-
-    fn store_idempotency_impl(ctx: *anyopaque, allocator: std.mem.Allocator, tenant_id: atomik.cqrs.UUID, key: []const u8, result: atomik.cqrs.IdempotencyResult) anyerror!void {
-        _ = ctx;
-        _ = allocator;
-        _ = tenant_id;
-        _ = key;
-        _ = result;
-    }
-
-    fn deinit_impl(ctx: *anyopaque) void {
-        const self: *InMemoryDemoStore = @ptrCast(@alignCast(ctx));
-        self.events.deinit(self.allocator);
-    }
-};
+    const state_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = aggregate.state }, .{});
+    const response = try std.fmt.allocPrint(
+        allocator,
+        "{{\"aggregate_id\":\"{s}\",\"version\":{d},\"state\":{s},\"event_count\":{d}}}",
+        .{ parsed.value.aggregate_id, aggregate.base.version, state_json, aggregate.event_count },
+    );
+    return .{ .status = 200, .body = response };
+}
